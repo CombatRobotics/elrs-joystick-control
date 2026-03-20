@@ -141,21 +141,68 @@ func (s *GRPCServer) StopHTTP(context.Context, *pb.Empty) (*pb.Empty, error) {
 
 func (s *GRPCServer) StartLink(_ context.Context, req *pb.StartLinkReq) (*pb.Empty, error) {
 
-	if req.Port == "" {
+	if req.GetPort() == "" {
 		return nil, status.Error(codes.InvalidArgument, "port_name is required")
 	}
 
-	if req.BaudRate <= 0 {
+	if req.GetBaudRate() <= 0 {
 		return nil, status.Error(codes.InvalidArgument, "baud_rate is required")
 	}
 
-	if err := s.LinkCtl.StartSupervisor(req.Port, req.BaudRate); err != nil {
+	portName, modelID, err := ParseStartLinkPortSpec(req.GetPort())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("invalid port/model id payload. %s", err.Error()))
+	}
+	if portName == "" {
+		return nil, status.Error(codes.InvalidArgument, "port_name is required")
+	}
+
+	if s.LinkCtl.IsSupervisorActive() {
+		activePort, activeBaudRate := s.LinkCtl.GetActiveLinkConfig()
+		if err := s.LinkCtl.SetModelID(modelID); err != nil {
+			return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("invalid model_id. %s", err.Error()))
+		}
+
+		if portName != activePort || req.GetBaudRate() != activeBaudRate {
+			fmt.Printf(
+				"(grpc) startLink active-update: requested port=%q baud=%d differs from active port=%q baud=%d. treating as model-id-only update\n",
+				portName,
+				req.GetBaudRate(),
+				activePort,
+				activeBaudRate,
+			)
+		}
+		fmt.Printf(
+			"(grpc) startLink active-update: active_port=%q active_baud=%d requested_model_id=%d\n",
+			activePort,
+			activeBaudRate,
+			modelID,
+		)
+		if err := s.LinkCtl.TriggerModelIDSend("grpc_startlink_active_update"); err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("could not queue model id frame. %s", err.Error()))
+		}
+		return &pb.Empty{}, nil
+	}
+
+	if err := s.LinkCtl.SetModelID(modelID); err != nil {
+		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("invalid model_id. %s", err.Error()))
+	}
+
+	fmt.Printf("(grpc) startLink request: raw_port=%q parsed_port=%q baud=%d model_id=%d\n",
+		req.GetPort(),
+		portName,
+		req.GetBaudRate(),
+		modelID,
+	)
+
+	if err := s.LinkCtl.StartSupervisor(portName, req.GetBaudRate()); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &pb.Empty{}, nil
 }
 
 func (s *GRPCServer) StopLink(context.Context, *pb.Empty) (*pb.Empty, error) {
+	fmt.Printf("(grpc) stopLink request (%s)\n", s.LinkCtl.GetModelIDDebugString())
 	if err := s.LinkCtl.StopSupervisor(); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}

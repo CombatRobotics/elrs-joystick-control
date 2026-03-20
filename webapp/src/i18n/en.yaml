@@ -109,6 +109,13 @@ strings:
       
     You can use the link statistics to see if the link is working correctly. The the number of
     sent and received packets should increase steadily without significant number of errors.
+  rf-link-model-id-title: |
+    Model ID
+  rf-link-model-id-help: |
+    This is the ExpressLRS Model Match ID sent in CRSF model-select frames.
+      
+      
+    Allowed values are from 0 to 63.
   port-state-title: |
     Port state
   port-state-help: |
@@ -165,6 +172,8 @@ strings:
     Could not start link.
   error-msg-link-not-stopped: |
     Could not stop link.
+  error-msg-model-id-invalid: |
+    Model ID must be an integer from 0 to 63.
   notif-config-loaded: |
     Config successfully loaded.
   notif-config-applied: |

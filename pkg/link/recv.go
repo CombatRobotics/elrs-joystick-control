@@ -78,12 +78,21 @@ Loop:
 			tickCount += 1
 			currentTickTime = time.Now()
 
-			timeSinceLastTelem := currentTickTime.Sub(lastRecvTelemTime) / time.Millisecond
-			timeSinceLastSyncReq := currentTickTime.Sub(lastSyncReqTime) / time.Millisecond
+			timeSinceLastTelem := currentTickTime.Sub(lastRecvTelemTime)
+			timeSinceLastSyncReq := currentTickTime.Sub(lastSyncReqTime)
 			if timeSinceLastTelem > maxInactivityTime && timeSinceLastSyncReq > maxInactivityTime {
-				fmt.Printf("(recv-loop) requesting TelemSync lt:%d, ls:%d\n", timeSinceLastTelem, timeSinceLastSyncReq)
-				lastSyncReqTime = currentTickTime
-				sendChan <- SendModelId
+				debugMsg := fmt.Sprintf("telem_inactive=%s sync_since=%s threshold=%s tick=%d",
+					timeSinceLastTelem.String(),
+					timeSinceLastSyncReq.String(),
+					maxInactivityTime.String(),
+					tickCount,
+				)
+				if err = c.TriggerModelIDSend(fmt.Sprintf("recv_inactivity %s", debugMsg)); err != nil {
+					fmt.Printf("(recv-loop) could not queue model-id frame. %s\n", err.Error())
+				} else {
+					fmt.Printf("(recv-loop) requesting model-id frame (%s)\n", c.GetModelIDDebugString())
+					lastSyncReqTime = currentTickTime
+				}
 			}
 
 			if tPacket, err = reader.Next(c.recvLoopTomb); err != nil {
@@ -100,6 +109,7 @@ Loop:
 
 			telemPacketCount += 1
 			c.recvPacketsCount += 1
+			lastRecvTelemTime = time.Now()
 
 			switch tFrame := (tPacket).(type) {
 			case telem.TelemStatusExtType:

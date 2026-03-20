@@ -363,7 +363,8 @@
     "details": {
       "link": {
         "tx": "COM16",
-        "baud-rate": "921600"
+        "baud-rate": "921600",
+        "model-id": "0"
       }
     },
     "key": "home_config"

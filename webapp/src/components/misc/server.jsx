@@ -7,6 +7,7 @@ import {JoystickControlPromiseClient} from "../../generated/server_grpc_web_pb";
 import {Empty, GetCRSFDeviceFieldsReq, SetConfigReq, SetCRSFDeviceFieldReq, StartLinkReq, Struct} from "../../pbwrap";
 import {getServerUrl, isMockBackend} from "./settings";
 import * as mock from "../mock/JoystickControlPromiseClient"
+import {encodeStartLinkPortSpec} from "./start-link-spec";
 
 export const getClient = function (serverUrl, credentials, options) {
     if (isMockBackend()) {
@@ -43,10 +44,10 @@ export const setConfig = async function (config) {
 };
 
 
-export const startLink = async function ({port, baudRate}) {
+export const startLink = async function ({port, baudRate, modelId}) {
     let client = getClient(getServerUrl(), null, null);
     let req = new StartLinkReq();
-    req.setPort(port);
+    req.setPort(encodeStartLinkPortSpec(port, modelId));
     req.setBaudRate(baudRate);
     // noinspection UnnecessaryLocalVariableJS
     let res = await client.startLink(req, {});

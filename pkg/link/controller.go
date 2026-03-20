@@ -14,6 +14,7 @@ import (
 	"github.com/kaack/elrs-joystick-control/pkg/proto/generated/pb"
 	sc "github.com/kaack/elrs-joystick-control/pkg/serial"
 	"gopkg.in/tomb.v2"
+	"sync"
 	"time"
 )
 
@@ -43,6 +44,20 @@ type Controller struct {
 
 	sendChan chan any
 	recvChan chan any
+
+	linkCfgMu      sync.RWMutex
+	activePortName string
+	activeBaudRate int32
+
+	modelIDMu               sync.RWMutex
+	modelID                 uint8
+	modelIDTriggerCount     uint64
+	modelIDSentCount        uint64
+	modelIDSendErrorCount   uint64
+	lastModelIDTriggerAt    time.Time
+	lastModelIDSentAt       time.Time
+	lastModelIDSendError    string
+	lastModelIDTriggerDebug string
 }
 
 func NewCtl(dc *dc.Controller, sc *sc.Controller, cc *cc.Controller) *Controller {
@@ -56,6 +71,7 @@ func NewCtl(dc *dc.Controller, sc *sc.Controller, cc *cc.Controller) *Controller
 		DeviceInfoBroadcaster:   NewTelemetryBroadcaster(),
 		DeviceFieldBroadcaster:  NewTelemetryBroadcaster(),
 		DeviceStatusBroadcaster: NewTelemetryBroadcaster(),
+		modelID:                 0,
 	}
 	err := linkCtl.Init()
 
@@ -87,6 +103,109 @@ func (c *Controller) GetLinkState(state *pb.LinkState) *pb.LinkState {
 	state.ErrorPacketsCount = c.errorPacketsCount
 
 	return state
+}
+
+func (c *Controller) SetModelID(modelID uint8) error {
+	if modelID < ModelIDMin || modelID > ModelIDMax {
+		return errors.New(fmt.Sprintf("model id must be in range [%d..%d], but got %d", ModelIDMin, ModelIDMax, modelID))
+	}
+
+	c.modelIDMu.Lock()
+	defer c.modelIDMu.Unlock()
+	c.modelID = modelID
+
+	fmt.Printf("(link) configured model id: %d\n", modelID)
+	return nil
+}
+
+func (c *Controller) GetModelID() uint8 {
+	c.modelIDMu.RLock()
+	defer c.modelIDMu.RUnlock()
+	return c.modelID
+}
+
+func (c *Controller) IsSupervisorActive() bool {
+	return c.supervisorState == SupervisorActive && c.supervisorTomb != nil && c.supervisorTomb.Alive()
+}
+
+func (c *Controller) SetActiveLinkConfig(portName string, baudRate int32) {
+	c.linkCfgMu.Lock()
+	defer c.linkCfgMu.Unlock()
+
+	c.activePortName = portName
+	c.activeBaudRate = baudRate
+}
+
+func (c *Controller) ClearActiveLinkConfig() {
+	c.linkCfgMu.Lock()
+	defer c.linkCfgMu.Unlock()
+
+	c.activePortName = ""
+	c.activeBaudRate = 0
+}
+
+func (c *Controller) GetActiveLinkConfig() (string, int32) {
+	c.linkCfgMu.RLock()
+	defer c.linkCfgMu.RUnlock()
+
+	return c.activePortName, c.activeBaudRate
+}
+
+func (c *Controller) TriggerModelIDSend(source string) error {
+	if c.sendChan == nil || !c.IsSupervisorActive() {
+		return errors.New("link is not active, model id frame was not queued")
+	}
+
+	c.RecordModelIDTrigger(fmt.Sprintf("source=%s", source))
+	select {
+	case c.sendChan <- SendModelId:
+		fmt.Printf("(link) queued model id send request (source=%s, %s)\n", source, c.GetModelIDDebugString())
+		return nil
+	case <-time.After(250 * time.Millisecond):
+		return errors.New("timeout while queuing model id frame")
+	}
+}
+
+func (c *Controller) RecordModelIDTrigger(debug string) {
+	c.modelIDMu.Lock()
+	defer c.modelIDMu.Unlock()
+
+	c.modelIDTriggerCount += 1
+	c.lastModelIDTriggerAt = time.Now()
+	c.lastModelIDTriggerDebug = debug
+}
+
+func (c *Controller) RecordModelIDSendOK() {
+	c.modelIDMu.Lock()
+	defer c.modelIDMu.Unlock()
+
+	c.modelIDSentCount += 1
+	c.lastModelIDSentAt = time.Now()
+	c.lastModelIDSendError = ""
+}
+
+func (c *Controller) RecordModelIDSendError(err error) {
+	c.modelIDMu.Lock()
+	defer c.modelIDMu.Unlock()
+
+	c.modelIDSendErrorCount += 1
+	c.lastModelIDSendError = err.Error()
+}
+
+func (c *Controller) GetModelIDDebugString() string {
+	c.modelIDMu.RLock()
+	defer c.modelIDMu.RUnlock()
+
+	return fmt.Sprintf("model_id=%d, triggers=%d, sent=%d, send_errors=%d, last_trigger=%s, last_send=%s, last_trigger_info=%s, last_send_error=%s",
+		c.modelID,
+		c.modelIDTriggerCount,
+		c.modelIDSentCount,
+		c.modelIDSendErrorCount,
+		c.lastModelIDTriggerAt.Format(time.RFC3339Nano),
+		c.lastModelIDSentAt.Format(time.RFC3339Nano),
+		c.lastModelIDTriggerDebug,
+		c.lastModelIDSendError,
+	)
 }
 
 func (c *Controller) GetCRSFDevices() ([]*pb.CRSFDeviceInfoData, error) {

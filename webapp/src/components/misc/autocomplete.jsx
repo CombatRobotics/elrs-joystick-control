@@ -17,6 +17,13 @@ export const AutoCompleteFunctions = {
             ["5250000", "5250000"]
         ]);
     },
+    'model-id': async () => {
+        let res = new Map();
+        for (let i = 0; i <= 63; i++) {
+            res.set(`${i}`, `${i}`);
+        }
+        return res;
+    },
     'precision-coordinate': async () => {
         return new Map([
             ["0", "0 decimals - 100,000 m"],

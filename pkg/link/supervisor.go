@@ -10,6 +10,7 @@ import (
 	"github.com/kaack/elrs-joystick-control/pkg/crossfire"
 	"github.com/kaack/elrs-joystick-control/pkg/serial"
 	"gopkg.in/tomb.v2"
+	"time"
 )
 
 func (c *Controller) StartSupervisor(port string, baudRate int32) error {
@@ -17,6 +18,8 @@ func (c *Controller) StartSupervisor(port string, baudRate int32) error {
 	if c.supervisorTomb != nil && c.supervisorTomb.Alive() {
 		return errors.New("link is already active")
 	}
+
+	c.SetActiveLinkConfig(port, baudRate)
 
 	c.supervisorTomb = &tomb.Tomb{}
 	c.supervisorTomb.Go(func() error {
@@ -77,6 +80,23 @@ Supervisor:
 
 		action("starting send loop", c.StartSendLoop(sport, sendChan, recvChan))
 		action("starting recv loop", c.StartRecvLoop(sport, sendChan, recvChan))
+		if err := c.TriggerModelIDSend("supervisor_start"); err != nil {
+			fmt.Printf("(supervisor) failed to queue startup model id frame. %s\n", err.Error())
+		}
+		go func() {
+			// The first model-id frame right after opening the serial port can be missed.
+			// Retry a few times to make startup deterministic.
+			startupDelays := []time.Duration{250 * time.Millisecond, 750 * time.Millisecond, 1500 * time.Millisecond}
+			for _, delay := range startupDelays {
+				time.Sleep(delay)
+				if err := c.TriggerModelIDSend(fmt.Sprintf("supervisor_start_retry_%dms", delay.Milliseconds())); err != nil {
+					if c.IsSupervisorActive() {
+						fmt.Printf("(supervisor) startup retry could not queue model id frame. %s\n", err.Error())
+					}
+					return
+				}
+			}
+		}()
 
 	Loop:
 		for {
@@ -105,5 +125,6 @@ Supervisor:
 
 	c.portState = PortUnknown
 	c.supervisorState = SupervisorInactive
+	c.ClearActiveLinkConfig()
 	return nil
 }

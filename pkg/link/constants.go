@@ -11,6 +11,11 @@ const (
 	PingDevices ChannelRequest = iota
 )
 
+const (
+	ModelIDMin uint8 = 0
+	ModelIDMax uint8 = 63
+)
+
 type ReadDeviceFieldsRequest struct {
 	deviceId   uint8
 	fieldId    uint8

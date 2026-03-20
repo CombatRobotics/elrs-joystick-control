@@ -70,12 +70,21 @@ Loop:
 			//receive data from the recv loop
 			case ChannelRequest:
 				if data == SendModelId {
-					fmt.Printf("(send-loop) writing model id frame\n")
-					if _, err = port.Write(crsf.CreateModelIDFrame(0)); err != nil {
+					modelID := c.GetModelID()
+					modelIDFrame := crsf.CreateModelIDFrame(modelID)
+					fmt.Printf("(send-loop) writing model id frame (model_id=%d frame=% X)\n", modelID, modelIDFrame)
+					var written int32
+					if written, err = port.Write(modelIDFrame); err != nil {
 						c.errorPacketsCount += 1
+						c.RecordModelIDSendError(err)
 						fmt.Printf("(send-loop) could not write model id frame on port %s. %s\n", port.Name, err.Error())
 						break
 					}
+					fmt.Printf("[MODEL_MATCH_TX_PACKET] time=%s port=%s model_id=%d bytes_written=%d packet=% X\n",
+						time.Now().Format(time.RFC3339Nano), port.Name, modelID, written, modelIDFrame,
+					)
+					c.RecordModelIDSendOK()
+					fmt.Printf("(send-loop) model id frame write ok (%s)\n", c.GetModelIDDebugString())
 					continue
 				} else if data == PingDevices {
 					fmt.Printf("(send-loop) pinging devices\n")

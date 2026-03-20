@@ -108,7 +108,7 @@ func GetRefreshRate(baudRate int32) time.Duration {
 		return 16 * 1000 * time.Microsecond
 	}
 
-	if baudRate <= 400000 {
+	if baudRate <= 420000 {
 		return 4 * 1000 * time.Microsecond
 	}
 

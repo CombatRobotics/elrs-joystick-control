@@ -21,6 +21,7 @@ import {MockGamepad} from "./MockGamepad";
 import {Warning} from "../misc/errors";
 import {MockCRSFDevice} from "./MockCRSFDevice";
 import {RpcError, StatusCode} from "grpc-web";
+import {decodeStartLinkPortSpec} from "../misc/start-link-spec";
 
 
 export const MockServer = function () {
@@ -91,8 +92,9 @@ MockServer.prototype.startLink = function (req) {
         throw new Error("link is already active")
     }
 
-    let port = req.getPort();
+    let {port, modelID} = decodeStartLinkPortSpec(req.getPort());
     let baudRate = req.getBaudRate();
+    console.info(`(mock) startLink port=${port} baud=${baudRate} model_id=${modelID}`);
 
     if (!port) {
         throw new Error("port is required");

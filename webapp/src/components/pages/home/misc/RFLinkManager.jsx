@@ -17,6 +17,7 @@ import {streamLink} from "../../../misc/streams";
 import {showError} from "../../../misc/notifications";
 import {PortState, SupervisorState} from "../../../../pbwrap";
 import {startLink, stopLink} from "../../../misc/server";
+import {normalizeModelID} from "../../../misc/start-link-spec";
 
 
 const portStateToString = function (state) {
@@ -55,11 +56,11 @@ const isStopLinkButtonDisabled = function (supervisorState) {
     return true;
 };
 
-const isLinkFieldReadOnly = function (supervisorState) {
+const isLinkFieldReadOnly = function (supervisorState, fieldName) {
     if (supervisorState === SupervisorState.SUPERVISORUNKNOWN) {
         return false;
     } else if (supervisorState === SupervisorState.SUPERVISORACTIVE) {
-        return true;
+        return fieldName !== TXModelIDField;
     } else if (supervisorState === SupervisorState.SUPERVISORINACTIVE) {
         return false;
     }
@@ -124,11 +125,14 @@ const LinkStateViewer = function ({linkStateViewerRef}) {
 
 const TXPortNameField = "tx";
 const TXBaudRateField = "baud-rate";
+const TXModelIDField = "model-id";
 export const RFLinkManager = function ({onClose, dataRef}) {
     const [open, setOpen] = useState(false);
     const formDataRef = useRef(null);
+    const lastModelIDLiveUpdateRef = useRef(null);
     const [formData, setFormData] = useState({
-        ...dataRef.current
+        ...dataRef.current,
+        [TXModelIDField]: dataRef.current?.[TXModelIDField] ?? "0"
     });
     const [loading, setLoading] = useState(true);
     const [fieldOpen, setFieldOpen] = useState({});
@@ -149,27 +153,72 @@ export const RFLinkManager = function ({onClose, dataRef}) {
         title: i18n("rf-link-baud-rate-title"),
         help: i18n("rf-link-baud-rate-help"),
         fetchOptionsMap: AutoCompleteFunctions["baud-rate"]
+    }, {
+        key: TXModelIDField,
+        title: i18n("rf-link-model-id-title"),
+        help: i18n("rf-link-model-id-help"),
+        fetchOptionsMap: AutoCompleteFunctions["model-id"]
     }])
 
     const streamRef = useRef();
 
     const onStartLink = useCallback(async function () {
         try {
+            const currentFormData = formDataRef.current || formData || {};
+            let modelId = normalizeModelID(currentFormData?.[TXModelIDField]);
+            if (modelId === null) {
+                showError(`${i18n("error-msg-model-id-invalid")}`);
+                return;
+            }
+
+            console.info(`(ui) startLink port=${currentFormData?.[TXPortNameField]} baud=${currentFormData?.[TXBaudRateField]} model_id=${modelId}`);
             //console.log(formData);
             await startLink({
-                port: formData?.[TXPortNameField],
-                baudRate: formData?.[TXBaudRateField]
+                port: currentFormData?.[TXPortNameField],
+                baudRate: currentFormData?.[TXBaudRateField],
+                modelId: modelId
             });
         } catch(ex) {
             showError(`${i18n("error-msg-link-not-started")} ${ex.message}`);
         }
-    },[formData]);
+    }, [formData]);
 
     const onStopLink = useCallback(async function() {
         try {
             await stopLink();
         } catch(ex) {
             showError(`${i18n("error-msg-link-not-stopped")} ${ex.message}`);
+        }
+    }, []);
+
+    const onUpdateModelIDWhileActive = useCallback(async function (modelIDValue) {
+        const requestedModelID = normalizeModelID(modelIDValue);
+        if (requestedModelID === null) {
+            console.warn(`(ui) live model-id update ignored due to invalid value: "${modelIDValue}"`);
+            return;
+        }
+        if (lastModelIDLiveUpdateRef.current === requestedModelID) {
+            return;
+        }
+
+        const currentFormData = formDataRef.current || {};
+        const currentModelID = normalizeModelID(currentFormData?.[TXModelIDField]);
+        if (currentModelID !== null && currentModelID === requestedModelID) {
+            return;
+        }
+
+        try {
+            lastModelIDLiveUpdateRef.current = requestedModelID;
+            console.info(`(ui) live model-id update request port=${currentFormData?.[TXPortNameField]} baud=${currentFormData?.[TXBaudRateField]} model_id=${requestedModelID}`);
+            await startLink({
+                port: currentFormData?.[TXPortNameField],
+                baudRate: currentFormData?.[TXBaudRateField],
+                modelId: requestedModelID
+            });
+            console.info(`(ui) live model-id update queued model_id=${requestedModelID}`);
+        } catch (ex) {
+            lastModelIDLiveUpdateRef.current = null;
+            showError(`Could not update model id while link is active. ${ex.message}`);
         }
     }, []);
 
@@ -276,8 +325,14 @@ export const RFLinkManager = function ({onClose, dataRef}) {
 
 
     const onAutoChange = useCallback(function (fieldName, newValue) {
-        setFormData({...formDataRef.current, [fieldName]: getAutoCompleteKey(newValue, fieldMaps[fieldName])});
-    }, null);
+        const currentFormData = formDataRef.current || {};
+        const updatedValue = getAutoCompleteKey(newValue, fieldMaps[fieldName]);
+        setFormData({...currentFormData, [fieldName]: updatedValue});
+
+        if (fieldName === TXModelIDField && supervisorState === SupervisorState.SUPERVISORACTIVE) {
+            onUpdateModelIDWhileActive(updatedValue);
+        }
+    }, [fieldMaps, supervisorState, onUpdateModelIDWhileActive]);
 
     const getFieldOptions = useCallback(function (fieldName) {
         let map = fieldMaps[fieldName];
@@ -359,7 +414,7 @@ export const RFLinkManager = function ({onClose, dataRef}) {
                                 }}
 
                                 options={getFieldOptions(fieldSpec.key)}
-                                disabled={isLinkFieldReadOnly(supervisorState)}
+                                disabled={isLinkFieldReadOnly(supervisorState, fieldSpec.key)}
 
                                 value={getAutoCompleteValue(formData[fieldSpec.key], fieldMaps[fieldSpec.key] || new Map())}
                                 inputValue={getAutoCompleteValue(formData[fieldSpec.key], fieldMaps[fieldSpec.key] || new Map())}
