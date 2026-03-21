@@ -5,53 +5,26 @@
 package server
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"github.com/golang/protobuf/jsonpb"
-	cc "github.com/kaack/elrs-joystick-control/pkg/config"
-	dc "github.com/kaack/elrs-joystick-control/pkg/devices"
 	"github.com/kaack/elrs-joystick-control/pkg/http"
 	lc "github.com/kaack/elrs-joystick-control/pkg/link"
 	"github.com/kaack/elrs-joystick-control/pkg/proto/generated/pb"
 	sc "github.com/kaack/elrs-joystick-control/pkg/serial"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/types/known/structpb"
 	"time"
 )
 
 type GRPCServer struct {
 	pb.UnimplementedJoystickControlServer
-	DevicesCtl *dc.Controller
-	SerialCtl  *sc.Controller
-	ConfigCtl  *cc.Controller
-	LinkCtl    *lc.Controller
-	HTTPCtl    *http.Controller
+	SerialCtl *sc.Controller
+	LinkCtl   *lc.Controller
+	HTTPCtl   *http.Controller
 }
 
 func (s *GRPCServer) GetGamepads(context.Context, *pb.Empty) (*pb.GetGamepadsRes, error) {
-
-	var res pb.GetGamepadsRes
-	for _, device := range s.DevicesCtl.Gamepads {
-		var (
-			protoDevice pb.Gamepad
-			deviceJson  []byte
-			err         error
-		)
-		if deviceJson, err = json.Marshal(device); err != nil {
-			return nil, status.Error(codes.Internal, err.Error())
-		}
-
-		if err := protojson.Unmarshal(deviceJson, &protoDevice); err != nil {
-			return nil, status.Error(codes.InvalidArgument, err.Error())
-		}
-		res.Gamepads = append(res.Gamepads, &protoDevice)
-	}
-
-	return &res, nil
+	return nil, status.Error(codes.Unimplemented, "gamepad support disabled in ROS2-only mode")
 }
 
 func (s *GRPCServer) GetTransmitters(context.Context, *pb.Empty) (*pb.GetTransmitterRes, error) {
@@ -73,56 +46,11 @@ func (s *GRPCServer) GetTransmitters(context.Context, *pb.Empty) (*pb.GetTransmi
 }
 
 func (s *GRPCServer) GetConfig(context.Context, *pb.Empty) (*pb.GetConfigRes, error) {
-	var configJson []byte
-	var err error
-
-	if configJson, err = json.Marshal(s.ConfigCtl.Config); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-
-	var configPb structpb.Struct
-	m := jsonpb.Unmarshaler{}
-	if err = m.Unmarshal(bytes.NewReader(configJson), &configPb); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-
-	res := &pb.GetConfigRes{
-		Config: &configPb,
-	}
-
-	return res, nil
+	return nil, status.Error(codes.Unimplemented, "config graph support disabled in ROS2-only mode")
 }
 
 func (s *GRPCServer) SetConfig(_ context.Context, req *pb.SetConfigReq) (*pb.Empty, error) {
-	m := jsonpb.Marshaler{}
-	js, err := m.MarshalToString(req)
-
-	sch := cc.GetSchema()
-
-	v := make(map[string]any)
-	if err := json.Unmarshal([]byte(js), &v); err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-
-	if err := sch.Validate(v); err != nil {
-		return nil, cc.ValidationError(codes.InvalidArgument,
-			"could not validate config against schema",
-			err)
-	}
-
-	tmp := struct {
-		Config *cc.Config `json:"config"`
-	}{}
-
-	err = json.Unmarshal([]byte(js), &tmp)
-
-	s.ConfigCtl.SetConfig(tmp.Config)
-
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-
-	return &pb.Empty{}, nil
+	return nil, status.Error(codes.Unimplemented, "config graph support disabled in ROS2-only mode")
 }
 
 func (s *GRPCServer) StartHTTP(context.Context, *pb.Empty) (*pb.Empty, error) {
@@ -210,97 +138,15 @@ func (s *GRPCServer) StopLink(context.Context, *pb.Empty) (*pb.Empty, error) {
 }
 
 func (s *GRPCServer) GetGamepadStream(req *pb.GetGamepadStreamReq, server pb.JoystickControl_GetGamepadStreamServer) error {
-
-	if req.Gamepad == nil {
-		return status.Error(codes.InvalidArgument, "device is required")
-	}
-
-	if req.Gamepad.Id == "" {
-		return status.Error(codes.InvalidArgument, "device.id is required")
-	}
-
-	//fmt.Printf("fetch response for id : %s\n", req.Device.Id)
-
-	var device *dc.InputGamepad
-	var ok bool
-	var err error
-	if device, ok = s.DevicesCtl.Gamepad(req.Gamepad.Id); !ok {
-		return status.Error(codes.InvalidArgument, fmt.Sprintf("gamepad(id: %s) device not found", req.Gamepad.Id))
-	}
-
-	state := s.DevicesCtl.GetGamepadStates(device, nil)
-	if err = s.StreamDeviceState(device, state, server); err != nil {
-		return err
-	}
-
-	ticker := time.NewTicker(time.Millisecond * 25)
-
-	for {
-		select {
-		case <-ticker.C:
-			s.DevicesCtl.AlertDeviceChan() //fake a device event to force evaluation
-		case <-s.DevicesCtl.DeviceEventChan:
-			if err = s.StreamDeviceState(device, state, server); err != nil {
-				return err
-			}
-		}
-	}
-
+	return status.Error(codes.Unimplemented, "gamepad stream disabled in ROS2-only mode")
 }
 
 func (s *GRPCServer) GetTransmitterStream(req *pb.GetTransmitterStreamReq, server pb.JoystickControl_GetTransmitterStreamServer) error {
-
-	if req.Transmitter == nil {
-		return status.Error(codes.InvalidArgument, "device is required")
-	}
-
-	if req.Transmitter.Port == "" {
-		return status.Error(codes.InvalidArgument, "device.port_name is required")
-	}
-
-	var err error
-
-	ticker := time.NewTicker(25 * time.Millisecond)
-	rfDeviceChannels := s.ConfigCtl.GetTransmitterChannels(req.Transmitter, nil)
-
-	if err = s.StreamRfDeviceChannels(req.Transmitter, rfDeviceChannels, server); err != nil {
-		return err
-	}
-
-	for {
-		select {
-		case <-ticker.C:
-			s.DevicesCtl.AlertDeviceChan() //fake a device event to force evaluation
-		case <-s.ConfigCtl.EvalEventChan:
-			if err = s.StreamRfDeviceChannels(req.Transmitter, rfDeviceChannels, server); err != nil {
-				return err
-			}
-		}
-	}
-
+	return status.Error(codes.Unimplemented, "transmitter config stream disabled in ROS2-only mode")
 }
 
 func (s *GRPCServer) GetEvalStream(_ *pb.Empty, server pb.JoystickControl_GetEvalStreamServer) error {
-
-	var err error
-
-	ticker := time.NewTicker(25 * time.Millisecond)
-	states := s.ConfigCtl.GetEvalStates(nil)
-
-	if err = s.StreamEvalStates(states, server); err != nil {
-		return err
-	}
-
-	for {
-		select {
-		case <-ticker.C:
-			s.ConfigCtl.AlertStreamChan() //fake event to force config eval
-		case <-s.ConfigCtl.EvalEventChan:
-			if err = s.StreamEvalStates(states, server); err != nil {
-				return err
-			}
-		}
-	}
+	return status.Error(codes.Unimplemented, "eval stream disabled in ROS2-only mode")
 }
 
 func (s *GRPCServer) GetLinkStream(_ *pb.Empty, server pb.JoystickControl_GetLinkStreamServer) error {

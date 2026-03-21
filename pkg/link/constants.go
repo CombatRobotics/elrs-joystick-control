@@ -11,6 +11,13 @@ const (
 	PingDevices ChannelRequest = iota
 )
 
+type ChannelSourceMode string
+
+const (
+	ChannelSourceConfig ChannelSourceMode = "config"
+	ChannelSourceROS2   ChannelSourceMode = "ros2"
+)
+
 const (
 	ModelIDMin uint8 = 0
 	ModelIDMax uint8 = 63

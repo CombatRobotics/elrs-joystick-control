@@ -7,21 +7,19 @@ package link
 import (
 	"errors"
 	"fmt"
-	cc "github.com/kaack/elrs-joystick-control/pkg/config"
 	"github.com/kaack/elrs-joystick-control/pkg/crossfire"
 	"github.com/kaack/elrs-joystick-control/pkg/crossfire/settings"
-	dc "github.com/kaack/elrs-joystick-control/pkg/devices"
 	"github.com/kaack/elrs-joystick-control/pkg/proto/generated/pb"
 	sc "github.com/kaack/elrs-joystick-control/pkg/serial"
+	"github.com/kaack/elrs-joystick-control/pkg/util"
 	"gopkg.in/tomb.v2"
+	"strings"
 	"sync"
 	"time"
 )
 
 type Controller struct {
-	devicesCtl *dc.Controller
-	serialCtl  *sc.Controller
-	configCtl  *cc.Controller
+	serialCtl *sc.Controller
 
 	channels [16]uint16
 
@@ -49,6 +47,25 @@ type Controller struct {
 	activePortName string
 	activeBaudRate int32
 
+	channelSourceMu   sync.RWMutex
+	channelSourceMode ChannelSourceMode
+	ros2TopicName     string
+
+	ros2SubscriberTomb *tomb.Tomb
+
+	ros2DataMu            sync.RWMutex
+	ros2MessageCount      uint64
+	ros2ParseErrorCount   uint64
+	ros2WriteCount        uint64
+	ros2LastRawLeftRPM    int32
+	ros2LastRawRightRPM   int32
+	ros2LastLeftCRSF      util.CRSFValue
+	ros2LastRightCRSF     util.CRSFValue
+	ros2LastRecvAt        time.Time
+	ros2LastWriteAt       time.Time
+	ros2LastWritePort     string
+	ros2LastSubscriberErr string
+
 	modelIDMu               sync.RWMutex
 	modelID                 uint8
 	modelIDTriggerCount     uint64
@@ -60,18 +77,18 @@ type Controller struct {
 	lastModelIDTriggerDebug string
 }
 
-func NewCtl(dc *dc.Controller, sc *sc.Controller, cc *cc.Controller) *Controller {
+func NewCtl(sc *sc.Controller) *Controller {
 	linkCtl := &Controller{
 		portState:               PortUnknown,
 		supervisorState:         SupervisorInactive,
-		devicesCtl:              dc,
 		serialCtl:               sc,
-		configCtl:               cc,
 		TelemetryBroadcaster:    NewTelemetryBroadcaster(),
 		DeviceInfoBroadcaster:   NewTelemetryBroadcaster(),
 		DeviceFieldBroadcaster:  NewTelemetryBroadcaster(),
 		DeviceStatusBroadcaster: NewTelemetryBroadcaster(),
 		modelID:                 0,
+		channelSourceMode:       ChannelSourceROS2,
+		ros2TopicName:           "WheelRPM",
 	}
 	err := linkCtl.Init()
 
@@ -122,6 +139,136 @@ func (c *Controller) GetModelID() uint8 {
 	c.modelIDMu.RLock()
 	defer c.modelIDMu.RUnlock()
 	return c.modelID
+}
+
+func (c *Controller) SetChannelSourceMode(mode string) error {
+	normalized := strings.ToLower(strings.TrimSpace(mode))
+	if normalized == "" {
+		normalized = string(ChannelSourceConfig)
+	}
+
+	switch ChannelSourceMode(normalized) {
+	case ChannelSourceConfig, ChannelSourceROS2:
+		c.channelSourceMu.Lock()
+		c.channelSourceMode = ChannelSourceMode(normalized)
+		c.channelSourceMu.Unlock()
+		fmt.Printf("(link) configured channel source mode: %s\n", normalized)
+		return nil
+	default:
+		return errors.New(fmt.Sprintf("invalid channel source mode %q, expected one of [%s,%s]", mode, ChannelSourceConfig, ChannelSourceROS2))
+	}
+}
+
+func (c *Controller) GetChannelSourceMode() ChannelSourceMode {
+	c.channelSourceMu.RLock()
+	defer c.channelSourceMu.RUnlock()
+	if c.channelSourceMode == "" {
+		return ChannelSourceConfig
+	}
+	return c.channelSourceMode
+}
+
+func (c *Controller) SetROS2TopicName(topic string) {
+	normalized := strings.TrimSpace(topic)
+	if normalized == "" {
+		normalized = "WheelRPM"
+	}
+	c.channelSourceMu.Lock()
+	c.ros2TopicName = normalized
+	c.channelSourceMu.Unlock()
+	fmt.Printf("(link) configured ros2 topic: %s\n", normalized)
+}
+
+func (c *Controller) GetROS2TopicName() string {
+	c.channelSourceMu.RLock()
+	defer c.channelSourceMu.RUnlock()
+	if c.ros2TopicName == "" {
+		return "WheelRPM"
+	}
+	return c.ros2TopicName
+}
+
+func (c *Controller) capToCRSFValue(raw int32) util.CRSFValue {
+	if raw < int32(util.CRSFMinValue) {
+		return util.CRSFValue(util.CRSFMinValue)
+	}
+	if raw > int32(util.CRSFMaxValue) {
+		return util.CRSFValue(util.CRSFMaxValue)
+	}
+	return util.CRSFValue(raw)
+}
+
+func (c *Controller) RecordROS2Message(rawLeftRPM int32, rawRightRPM int32) (util.CRSFValue, util.CRSFValue) {
+	leftCRSF := c.capToCRSFValue(rawLeftRPM)
+	rightCRSF := c.capToCRSFValue(rawRightRPM)
+
+	c.ros2DataMu.Lock()
+	defer c.ros2DataMu.Unlock()
+
+	c.ros2MessageCount += 1
+	c.ros2LastRawLeftRPM = rawLeftRPM
+	c.ros2LastRawRightRPM = rawRightRPM
+	c.ros2LastLeftCRSF = leftCRSF
+	c.ros2LastRightCRSF = rightCRSF
+	c.ros2LastRecvAt = time.Now()
+
+	return leftCRSF, rightCRSF
+}
+
+func (c *Controller) RecordROS2ParseError(err error, line string) {
+	c.ros2DataMu.Lock()
+	defer c.ros2DataMu.Unlock()
+
+	c.ros2ParseErrorCount += 1
+	c.ros2LastSubscriberErr = fmt.Sprintf("line=%q err=%v", line, err)
+}
+
+func (c *Controller) RecordROS2Write(port string, leftCRSF util.CRSFValue, rightCRSF util.CRSFValue) {
+	c.ros2DataMu.Lock()
+	defer c.ros2DataMu.Unlock()
+
+	c.ros2WriteCount += 1
+	c.ros2LastWriteAt = time.Now()
+	c.ros2LastWritePort = port
+	c.ros2LastLeftCRSF = leftCRSF
+	c.ros2LastRightCRSF = rightCRSF
+}
+
+func (c *Controller) SetROS2LastError(err string) {
+	c.ros2DataMu.Lock()
+	defer c.ros2DataMu.Unlock()
+	c.ros2LastSubscriberErr = err
+}
+
+func (c *Controller) GetROS2ChannelsSnapshot() ([16]util.CRSFValue, util.CRSFValue, util.CRSFValue) {
+	c.ros2DataMu.RLock()
+	defer c.ros2DataMu.RUnlock()
+
+	var channels [16]util.CRSFValue
+	channels[0] = c.ros2LastLeftCRSF
+	channels[1] = c.ros2LastRightCRSF
+	return channels, c.ros2LastLeftCRSF, c.ros2LastRightCRSF
+}
+
+func (c *Controller) GetROS2DebugString() string {
+	c.ros2DataMu.RLock()
+	defer c.ros2DataMu.RUnlock()
+
+	return fmt.Sprintf(
+		"topic=%s msgs=%d parse_errors=%d writes=%d last_raw_left=%d last_raw_right=%d last_left_crsf=%d last_right_crsf=%d last_recv=%s last_write=%s last_write_port=%s last_err=%s",
+		c.GetROS2TopicName(),
+		c.ros2MessageCount,
+		c.ros2ParseErrorCount,
+		c.ros2WriteCount,
+		c.ros2LastRawLeftRPM,
+		c.ros2LastRawRightRPM,
+		c.ros2LastLeftCRSF,
+		c.ros2LastRightCRSF,
+		c.ros2LastRecvAt.Format(time.RFC3339Nano),
+		c.ros2LastWriteAt.Format(time.RFC3339Nano),
+		c.ros2LastWritePort,
+		c.ros2LastSubscriberErr,
+	)
 }
 
 func (c *Controller) IsSupervisorActive() bool {

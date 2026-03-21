@@ -43,21 +43,16 @@ func (c *Controller) StopSendLoop() error {
 
 //goland:noinspection GoUnusedParameter
 func (c *Controller) SendLoop(port *serial.Port, sendChan chan any, recvChan chan any) error {
-
-	currentRefreshRate := crsf.GetRefreshRate(port.BaudRate)
-	nextRefreshRate := currentRefreshRate
-
-	fmt.Printf("(send-loop) starting, refresh rate %v\n", currentRefreshRate)
+	const fixedChannelSendPeriod = 10 * time.Millisecond
+	fmt.Printf("(send-loop) starting, fixed channel refresh period %v (independent of baud)\n", fixedChannelSendPeriod)
 
 	var err error
-	var ok bool
-
-	ticker := time.NewTicker(currentRefreshRate)
-
-	var channelsDataMap *map[string]*[16]util.CRSFValue
-	var channelsData *[16]util.CRSFValue
+	ticker := time.NewTicker(fixedChannelSendPeriod)
 
 	c.sentPacketsCount = 0
+	configModeWarningPrinted := false
+	unknownModeWarningPrinted := false
+	zeroChannels := [16]util.CRSFValue{}
 
 Loop:
 	for {
@@ -65,9 +60,7 @@ Loop:
 		case <-c.sendLoopTomb.Dying():
 			break Loop
 		case chData := <-sendChan:
-			//fmt.Printf("chData: %v\n", chData)
 			switch data := (chData).(type) {
-			//receive data from the recv loop
 			case ChannelRequest:
 				if data == SendModelId {
 					modelID := c.GetModelID()
@@ -95,7 +88,6 @@ Loop:
 					}
 				}
 			case *ReadDeviceFieldsRequest:
-				//fmt.Printf("(send-loop) reading device fields (deviceId: %v)\n", data.deviceId)
 				if _, err = port.Write(crsf.CreateParameterSettingsReadFrame(data.deviceId, data.fieldId, data.fieldChunk)); err != nil {
 					c.errorPacketsCount += 1
 					fmt.Printf("(send-loop) could not write \"parameters-settings-read\" frame on port %s. %s\n", port.Name, err.Error())
@@ -115,42 +107,48 @@ Loop:
 					fmt.Printf("(send-loop) could not write \"parameters-settings-write-uint16\" frame on port %s. %s\n", port.Name, err.Error())
 					break
 				}
-
 			case *telem.TelemSyncType:
-				nextRefreshRate = crsf.AdjustSendRate((*data).Rate(), (*data).Offset())
-				ticker.Reset(nextRefreshRate)
-				//fmt.Printf("(send-loop) rate: %v, offset: %v, newRate: %v\n", time.Duration((*data).Rate()/10)*time.Microsecond, time.Duration((*data).Offset()/10)*time.Microsecond, nextRefreshRate)
+				// Intentionally ignored: channel send period is fixed to 10ms.
+				// Keep consuming this type so recv->send sync events don't appear as unknown requests.
 			default:
 				fmt.Printf("(send-loop) unknown channel request\n")
 			}
 
 		case <-ticker.C:
-			if channelsDataMap != c.configCtl.EvalDataMap && c.configCtl.EvalDataMap != nil {
-				channelsDataMap = c.configCtl.EvalDataMap
-			}
+			switch c.GetChannelSourceMode() {
+			case ChannelSourceROS2:
+				ros2Channels, leftCRSF, rightCRSF := c.GetROS2ChannelsSnapshot()
+				if _, err = port.Write(crsf.PackChannels(&ros2Channels)); err != nil {
+					fmt.Printf("(send-loop) could not write ros2 channels on port %s. %s\n", port.Name, err.Error())
+					break Loop
+				}
 
-			if channelsDataMap == nil {
-				channelsData = c.configCtl.EvalNoData
-			} else if channelsData, ok = (*channelsDataMap)[port.Name]; !ok {
-				channelsData = c.configCtl.EvalNoData
-			}
+				c.sentPacketsCount += 1
+				c.RecordROS2Write(port.Name, leftCRSF, rightCRSF)
+				fmt.Printf("(send-loop) Written Left: %d, Right: %d (port=%s)\n", leftCRSF, rightCRSF, port.Name)
 
-			if channelsData != c.configCtl.EvalNoData {
-				//PrintChannels(channelsData)
-			}
+			case ChannelSourceConfig:
+				if !configModeWarningPrinted {
+					fmt.Printf("(send-loop) channel source 'config' is disabled in this ROS2-only build. writing zero channels\n")
+					configModeWarningPrinted = true
+				}
+				if _, err = port.Write(crsf.PackChannels(&zeroChannels)); err != nil {
+					fmt.Printf("(send-loop) could not write fallback zero channels on port %s. %s\n", port.Name, err.Error())
+					break Loop
+				}
+				c.sentPacketsCount += 1
 
-			if _, err = port.Write(crsf.PackChannels(channelsData)); err != nil {
-				//if _, err = port.Write(crsf.PackChannels(c.configCtl.EvalCenter)); err != nil {
-				fmt.Printf("(send-loop) could not write channels on port %s. %s\n", port.Name, err.Error())
-				break Loop
+			default:
+				if !unknownModeWarningPrinted {
+					fmt.Printf("(send-loop) unknown channel source mode %q. writing zero channels\n", c.GetChannelSourceMode())
+					unknownModeWarningPrinted = true
+				}
+				if _, err = port.Write(crsf.PackChannels(&zeroChannels)); err != nil {
+					fmt.Printf("(send-loop) could not write fallback zero channels on port %s. %s\n", port.Name, err.Error())
+					break Loop
+				}
+				c.sentPacketsCount += 1
 			}
-
-			//if currentRefreshRate != nextRefreshRate {
-			//	fmt.Printf("(send-loop) oldRate: %v, newRate: %v, packets: %v\n", currentRefreshRate, nextRefreshRate, c.sentPacketsCount)
-			//	currentRefreshRate = nextRefreshRate
-			//	ticker.Reset(nextRefreshRate)
-			//}
-			c.sentPacketsCount += 1
 		}
 	}
 

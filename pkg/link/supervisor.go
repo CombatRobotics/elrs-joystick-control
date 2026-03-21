@@ -48,8 +48,11 @@ func action(action string, err error) {
 	}
 }
 func (c *Controller) SupervisorLoop(port string, baudRate int32) error {
-	fmt.Printf("(supervisor) starting, port: %s, baud: %v ...\n", port, baudRate)
+	fmt.Printf("(supervisor) starting, port: %s, baud: %v, channel_source=%s ...\n", port, baudRate, c.GetChannelSourceMode())
 	c.supervisorState = SupervisorActive
+	if err := c.StartROS2Subscriber(); err != nil {
+		fmt.Printf("(supervisor) could not start ros2 subscriber. %s\n", err.Error())
+	}
 
 	refreshRate := crossfire.GetRefreshRate(baudRate)
 	sport := &serial.Port{Name: port, BaudRate: baudRate, ReadTimeout: refreshRate * 4}
@@ -121,6 +124,7 @@ Supervisor:
 
 	action("stopping recv loop", c.StopRecvLoop())
 	action("stopping send loop", c.StopSendLoop())
+	action("stopping ros2 subscriber", c.StopROS2Subscriber())
 	action("closing serial port", sport.Close())
 
 	c.portState = PortUnknown

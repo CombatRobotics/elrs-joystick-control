@@ -8,8 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"github.com/kaack/elrs-joystick-control/pkg/client"
-	cc "github.com/kaack/elrs-joystick-control/pkg/config"
-	dc "github.com/kaack/elrs-joystick-control/pkg/devices"
 	hc "github.com/kaack/elrs-joystick-control/pkg/http"
 	lc "github.com/kaack/elrs-joystick-control/pkg/link"
 	sc "github.com/kaack/elrs-joystick-control/pkg/serial"
@@ -35,8 +33,11 @@ func main() {
 	txServerPortBaudRate := new(int)
 	flag.IntVar(txServerPortBaudRate, "tx-serial-port-baud-rate", 921600, "tx Serial port baud rate")
 
-	configFilePath := new(string)
-	flag.StringVar(configFilePath, "config-file-path", "", "config json file path")
+	channelSourceMode := new(string)
+	flag.StringVar(channelSourceMode, "channel-source-mode", string(lc.ChannelSourceROS2), "channel source mode: config|ros2")
+
+	ros2TopicName := new(string)
+	flag.StringVar(ros2TopicName, "ros2-topic-name", "WheelRPM", "ROS2 topic used when channel-source-mode=ros2")
 
 	disableWebUI := new(bool)
 	flag.BoolVar(disableWebUI, "disable-web-ui", false, "disable the Web-UI HTTP server")
@@ -49,24 +50,21 @@ func main() {
 	httpCtl := hc.NewCtl(*webAppPort, grpcServer)
 	defer httpCtl.Quit()
 
-	devicesCtl := dc.NewCtl()
-	defer devicesCtl.Quit()
-
-	configCtl := cc.NewCtl(devicesCtl)
-
-	defer configCtl.Quit()
-
 	serialCtl := sc.NewCtl()
 	defer serialCtl.Quit()
 
-	linkCtl := lc.NewCtl(devicesCtl, serialCtl, configCtl)
+	linkCtl := lc.NewCtl(serialCtl)
 	defer linkCtl.Quit()
+	if err := linkCtl.SetChannelSourceMode(*channelSourceMode); err != nil {
+		panic(err)
+	}
+	linkCtl.SetROS2TopicName(*ros2TopicName)
 
-	serverCtl := gc.NewCtl(*grpcPort, grpcServer, devicesCtl, serialCtl, configCtl, linkCtl, httpCtl)
+	serverCtl := gc.NewCtl(*grpcPort, grpcServer, serialCtl, linkCtl, httpCtl)
 	defer serverCtl.Quit()
 
 	// Automatically configure through gprc when conditions are met
-	client.Init(*txServerPortName, *configFilePath, *txServerPortBaudRate, *grpcPort, *disableWebUI)
+	client.Init(*txServerPortName, *txServerPortBaudRate, *grpcPort, *disableWebUI)
 
 	go func() {
 		sigChan := make(chan os.Signal)
