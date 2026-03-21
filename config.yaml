@@ -1,0 +1,29 @@
+serial:
+  tx_port_name: "/dev/ttyUSB0"
+  tx_baud_rate: 400000
+
+ros2:
+  topic_name: "/WheelRPM"
+
+link:
+  channel_send_period_ms: 10
+
+model_match:
+  model_id: 5
+
+# Channel counting is 0-15
+# Pakcet rate in TX is 100Hz - only 8 channels available
+# Channel 4 is a digital channel (191 or 1792)
+mapping:
+  left_rpm_channel: 6
+  right_rpm_channel: 8
+  other_channels_default: 0
+
+limits:
+  crsf_min: 0
+  crsf_max: 2047
+
+logging:
+  ros2_rx: true
+  tx_writes: true
+  subscriber_errors: true
