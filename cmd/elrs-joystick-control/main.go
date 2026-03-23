@@ -30,7 +30,10 @@ const (
 	absoluteCRSFMax = 2047
 	minModelID      = 0
 	maxModelID      = 63
+	modelIDRetries  = 5
 )
+
+const modelIDRetryDelay = 250 * time.Millisecond
 
 type SerialConfig struct {
 	TXPortName string `yaml:"tx_port_name"`
@@ -473,6 +476,37 @@ func sendModelIDFrame(port serial.Port, modelID uint8, source string, logWrites 
 	return nil
 }
 
+func sendModelIDFrameWithRetry(port serial.Port, modelID uint8, retries int, delay time.Duration, logWrites bool) error {
+	if retries < 1 {
+		retries = 1
+	}
+
+	successCount := 0
+	var lastErr error
+
+	for attempt := 1; attempt <= retries; attempt++ {
+		source := fmt.Sprintf("startup burst=%d/%d", attempt, retries)
+		err := sendModelIDFrame(port, modelID, source, logWrites)
+		if err != nil {
+			lastErr = err
+			fmt.Printf("(model-id) burst attempt=%d/%d failed model_id=%d err=%s\n", attempt, retries, modelID, err.Error())
+		} else {
+			successCount++
+		}
+
+		if attempt < retries {
+			time.Sleep(delay)
+		}
+	}
+
+	if successCount == 0 {
+		return fmt.Errorf("(model-id) all burst attempts failed model_id=%d attempts=%d last_error=%w", modelID, retries, lastErr)
+	}
+
+	fmt.Printf("(model-id) startup burst complete model_id=%d success=%d/%d\n", modelID, successCount, retries)
+	return nil
+}
+
 func main() {
 	cfg, err := loadConfig(configFilePath)
 	if err != nil {
@@ -483,7 +517,6 @@ func main() {
 	minValue := util.CRSFValue(cfg.Limits.CRSFMin)
 	maxValue := util.CRSFValue(cfg.Limits.CRSFMax)
 	otherDefault := util.CRSFValue(cfg.Mapping.OtherChannelsDefault)
-
 	fmt.Printf("(app) loaded config=%s\n", configFilePath)
 	fmt.Printf(
 		"(app) starting ROS2->CRSF pipeline port=%s baud=%d model_id=%d topic=%s period_ms=%d left_ch=%d right_ch=%d other_default=%d limits=[%d..%d]\n",
@@ -516,7 +549,7 @@ func main() {
 	}()
 	fmt.Printf("(app) serial port opened %s @ %d baud\n", cfg.Serial.TXPortName, cfg.Serial.TXBaudRate)
 
-	if err = sendModelIDFrame(serialPort, uint8(cfg.ModelMatch.ModelID), "startup", cfg.Logging.TXWrites); err != nil {
+	if err = sendModelIDFrameWithRetry(serialPort, uint8(cfg.ModelMatch.ModelID), modelIDRetries, modelIDRetryDelay, cfg.Logging.TXWrites); err != nil {
 		fmt.Printf("%s\n", err.Error())
 	}
 
