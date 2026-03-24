@@ -55,6 +55,7 @@ type ModelMatchConfig struct {
 type MappingConfig struct {
 	LeftRPMChannel       int `yaml:"left_rpm_channel"`
 	RightRPMChannel      int `yaml:"right_rpm_channel"`
+	ScalingFactor        int `yaml:"scaling_factor"`
 	OtherChannelsDefault int `yaml:"other_channels_default"`
 }
 
@@ -97,6 +98,7 @@ func defaultConfig() Config {
 		Mapping: MappingConfig{
 			LeftRPMChannel:       0,
 			RightRPMChannel:      1,
+			ScalingFactor:        1,
 			OtherChannelsDefault: 0,
 		},
 		Limits: LimitsConfig{
@@ -159,6 +161,9 @@ func (c *Config) validate() error {
 	if c.Mapping.LeftRPMChannel == c.Mapping.RightRPMChannel {
 		return fmt.Errorf("mapping.left_rpm_channel and mapping.right_rpm_channel must be different, both are %d", c.Mapping.LeftRPMChannel)
 	}
+	if c.Mapping.ScalingFactor <= 0 {
+		return fmt.Errorf("mapping.scaling_factor must be > 0, got %d", c.Mapping.ScalingFactor)
+	}
 
 	if c.Limits.CRSFMin < 0 || c.Limits.CRSFMin > absoluteCRSFMax {
 		return fmt.Errorf("limits.crsf_min must be in [0..%d], got %d", absoluteCRSFMax, c.Limits.CRSFMin)
@@ -190,9 +195,9 @@ type wheelState struct {
 	lastError       string
 }
 
-func (w *wheelState) update(rawLeft int32, rawRight int32, minValue util.CRSFValue, maxValue util.CRSFValue) (util.CRSFValue, util.CRSFValue) {
-	left := capToCRSFValue(rawLeft, minValue, maxValue)
-	right := capToCRSFValue(rawRight, minValue, maxValue)
+func (w *wheelState) update(rawLeft int32, rawRight int32, scalingFactor int, minValue util.CRSFValue, maxValue util.CRSFValue) (util.CRSFValue, util.CRSFValue) {
+	left := capToCRSFValue(rawLeft, scalingFactor, minValue, maxValue)
+	right := capToCRSFValue(rawRight, scalingFactor, minValue, maxValue)
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -241,14 +246,15 @@ func (w *wheelState) debugString(topic string) string {
 	)
 }
 
-func capToCRSFValue(raw int32, minValue util.CRSFValue, maxValue util.CRSFValue) util.CRSFValue {
-	if raw < int32(minValue) {
+func capToCRSFValue(raw int32, scalingFactor int, minValue util.CRSFValue, maxValue util.CRSFValue) util.CRSFValue {
+	scaled := int64(raw) * int64(scalingFactor)
+	if scaled < int64(minValue) {
 		return minValue
 	}
-	if raw > int32(maxValue) {
+	if scaled > int64(maxValue) {
 		return maxValue
 	}
-	return util.CRSFValue(raw)
+	return util.CRSFValue(scaled)
 }
 
 func parseROS2FieldInt32(prefix string, line string) (int32, error) {
@@ -286,6 +292,7 @@ func consumeROS2Stdout(
 	ctx context.Context,
 	reader io.Reader,
 	state *wheelState,
+	scalingFactor int,
 	minValue util.CRSFValue,
 	maxValue util.CRSFValue,
 	logRX bool,
@@ -314,7 +321,7 @@ func consumeROS2Stdout(
 			return
 		}
 
-		left, right := state.update(rawLeftRPM, rawRightRPM, minValue, maxValue)
+		left, right := state.update(rawLeftRPM, rawRightRPM, scalingFactor, minValue, maxValue)
 		if logRX {
 			fmt.Printf("(ros2) WheelRPM raw left=%d right=%d capped left=%d right=%d\n", rawLeftRPM, rawRightRPM, left, right)
 		}
@@ -372,6 +379,7 @@ func runROS2Subscriber(
 	ctx context.Context,
 	topic string,
 	state *wheelState,
+	scalingFactor int,
 	minValue util.CRSFValue,
 	maxValue util.CRSFValue,
 	logCfg LoggingConfig,
@@ -421,7 +429,7 @@ func runROS2Subscriber(
 					}
 
 					go consumeROS2Stderr(cmdCtx, stderr, state, logCfg.SubscriberErrors)
-					readErr := consumeROS2Stdout(cmdCtx, stdout, state, minValue, maxValue, logCfg.ROS2RX, logCfg.SubscriberErrors)
+					readErr := consumeROS2Stdout(cmdCtx, stdout, state, scalingFactor, minValue, maxValue, logCfg.ROS2RX, logCfg.SubscriberErrors)
 					waitErr := cmd.Wait()
 					cancel()
 
@@ -519,7 +527,7 @@ func main() {
 	otherDefault := util.CRSFValue(cfg.Mapping.OtherChannelsDefault)
 	fmt.Printf("(app) loaded config=%s\n", configFilePath)
 	fmt.Printf(
-		"(app) starting ROS2->CRSF pipeline port=%s baud=%d model_id=%d topic=%s period_ms=%d left_ch=%d right_ch=%d other_default=%d limits=[%d..%d]\n",
+		"(app) starting ROS2->CRSF pipeline port=%s baud=%d model_id=%d topic=%s period_ms=%d left_ch=%d right_ch=%d scaling_factor=%d other_default=%d limits=[%d..%d]\n",
 		cfg.Serial.TXPortName,
 		cfg.Serial.TXBaudRate,
 		cfg.ModelMatch.ModelID,
@@ -562,7 +570,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if subErr := runROS2Subscriber(ctx, cfg.ROS2.TopicName, state, minValue, maxValue, cfg.Logging); subErr != nil {
+		if subErr := runROS2Subscriber(ctx, cfg.ROS2.TopicName, state, cfg.Mapping.ScalingFactor, minValue, maxValue, cfg.Logging); subErr != nil {
 			fmt.Printf("(ros2) subscriber fatal error. %s\n", subErr.Error())
 			cancel()
 		}

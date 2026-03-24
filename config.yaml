@@ -17,11 +17,12 @@ model_match:
 mapping:
   left_rpm_channel: 6
   right_rpm_channel: 8
+  scaling_factor: 4
   other_channels_default: 0
 
 limits:
   crsf_min: 0
-  crsf_max: 2047
+  crsf_max: 511  # 2047 / scaling_factor (4)
 
 logging:
   ros2_rx: true
