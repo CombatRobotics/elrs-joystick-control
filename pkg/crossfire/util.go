@@ -29,6 +29,31 @@ func CreateModelIDFrame(modelId uint8) []uint8 {
 	return frame
 }
 
+// CreatePR100FFrame returns exact raw ELRS command bytes for Packet Rate = 100Hz Full.
+func CreatePR100FFrame() []uint8 {
+	return []uint8{0xEE, 0x06, 0x2D, 0xEE, 0xEA, 0x01, 0x01, 0xE5}
+}
+
+// CreateTLMOffFrame returns exact raw ELRS command bytes for Telemetry = Off.
+func CreateTLMOffFrame() []uint8 {
+	return []uint8{0xEE, 0x06, 0x2D, 0xEE, 0xEA, 0x02, 0x01, 0xF8}
+}
+
+// CreateSW8CHFrame returns exact raw ELRS command bytes for Switch mode = 8ch.
+func CreateSW8CHFrame() []uint8 {
+	return []uint8{0xEE, 0x06, 0x2D, 0xEE, 0xEA, 0x03, 0x00, 0x26}
+}
+
+// CreateLMNormFrame returns exact raw ELRS command bytes for Link mode = Normal.
+func CreateLMNormFrame() []uint8 {
+	return []uint8{0xEE, 0x06, 0x2D, 0xEE, 0xEA, 0x04, 0x00, 0x17}
+}
+
+// CreateMMOnFrame returns exact raw ELRS command bytes for Model Match = On.
+func CreateMMOnFrame() []uint8 {
+	return []uint8{0xEE, 0x06, 0x2D, 0xEE, 0xEA, 0x05, 0x01, 0xC9}
+}
+
 func CreatePingDevicesFrame() []uint8 {
 	frame := []uint8{
 		/* 0: */ uint8(UartSyncFrame),

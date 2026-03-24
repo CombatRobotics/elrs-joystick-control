@@ -35,6 +35,11 @@ const (
 
 const modelIDRetryDelay = 250 * time.Millisecond
 
+const (
+	initConfigRetries   = 3
+	initConfigSendDelay = 50 * time.Millisecond
+)
+
 type SerialConfig struct {
 	TXPortName string `yaml:"tx_port_name"`
 	TXBaudRate int    `yaml:"tx_baud_rate"`
@@ -464,6 +469,64 @@ func runROS2Subscriber(
 	}
 }
 
+type namedInitPacket struct {
+	name  string
+	bytes []byte
+}
+
+func sendRawInitPacket(port serial.Port, packet namedInitPacket, attempt int, retries int, logWrites bool) error {
+	written, err := port.Write(packet.bytes)
+	if err != nil {
+		return fmt.Errorf("(init-config) write failed packet=%s attempt=%d/%d err=%w", packet.name, attempt, retries, err)
+	}
+
+	if logWrites {
+		fmt.Printf("[ELRS_INIT_PACKET] time=%s packet=%s attempt=%d/%d bytes_written=%d payload=% X\n",
+			time.Now().Format(time.RFC3339Nano),
+			packet.name,
+			attempt,
+			retries,
+			written,
+			packet.bytes,
+		)
+	}
+	return nil
+}
+
+// sendELRSInitConfigSequence sends exact raw ELRS setup packets after Model ID write.
+// Each packet is sent 3 times with 50ms delay to improve reliability over one-way serial links.
+func sendELRSInitConfigSequence(port serial.Port, logWrites bool) error {
+	sequence := []namedInitPacket{
+		{name: "PR100F", bytes: crsf.CreatePR100FFrame()},
+		{name: "TLMOff", bytes: crsf.CreateTLMOffFrame()},
+		{name: "SW8CH", bytes: crsf.CreateSW8CHFrame()},
+		{name: "LMNorm", bytes: crsf.CreateLMNormFrame()},
+		{name: "MMOn", bytes: crsf.CreateMMOnFrame()},
+	}
+
+	for _, pkt := range sequence {
+		success := 0
+		var lastErr error
+		for attempt := 1; attempt <= initConfigRetries; attempt++ {
+			err := sendRawInitPacket(port, pkt, attempt, initConfigRetries, logWrites)
+			if err != nil {
+				lastErr = err
+				fmt.Printf("%s\n", err.Error())
+			} else {
+				success++
+			}
+			time.Sleep(initConfigSendDelay)
+		}
+
+		if success == 0 {
+			return fmt.Errorf("(init-config) all attempts failed packet=%s last_error=%w", pkt.name, lastErr)
+		}
+		fmt.Printf("(init-config) packet complete name=%s success=%d/%d\n", pkt.name, success, initConfigRetries)
+	}
+
+	return nil
+}
+
 func sendModelIDFrame(port serial.Port, modelID uint8, source string, logWrites bool) error {
 	frame := crsf.CreateModelIDFrame(modelID)
 	written, err := port.Write(frame)
@@ -535,6 +598,7 @@ func main() {
 		cfg.Link.ChannelSendPeriodMS,
 		cfg.Mapping.LeftRPMChannel,
 		cfg.Mapping.RightRPMChannel,
+		cfg.Mapping.ScalingFactor,
 		cfg.Mapping.OtherChannelsDefault,
 		cfg.Limits.CRSFMin,
 		cfg.Limits.CRSFMax,
@@ -560,6 +624,10 @@ func main() {
 	if err = sendModelIDFrameWithRetry(serialPort, uint8(cfg.ModelMatch.ModelID), modelIDRetries, modelIDRetryDelay, cfg.Logging.TXWrites); err != nil {
 		fmt.Printf("%s\n", err.Error())
 	}
+	if err = sendELRSInitConfigSequence(serialPort, cfg.Logging.TXWrites); err != nil {
+		fmt.Printf("%s\n", err.Error())
+	}
+
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
