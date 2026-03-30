@@ -29,6 +29,7 @@ import (
 const (
 	configFilePath           = "config.yaml"
 	defaultControlSocketPath = "/tmp/tota_elrs_bridge_model_id.sock"
+	defaultChannelSocketPath = "/tmp/tota_elrs_bridge_channels.sock"
 	minChannelIndex          = 0
 	maxChannelIndex          = 15
 	absoluteCRSFMax          = 2047
@@ -104,6 +105,15 @@ type setModelIDIPCResponse struct {
 	Message string `json:"message"`
 }
 
+type setChannelsIPCRequest struct {
+	Channels []int `json:"channels"`
+}
+
+type channelFrameState struct {
+	mu       sync.RWMutex
+	channels [16]util.CRSFValue
+}
+
 func defaultConfig() Config {
 	return Config{
 		Serial: SerialConfig{
@@ -174,33 +184,6 @@ func (c *Config) validate() error {
 
 	if c.ModelMatch.ModelID < minModelID || c.ModelMatch.ModelID > maxModelID {
 		return fmt.Errorf("model_match.model_id must be in [%d..%d], got %d", minModelID, maxModelID, c.ModelMatch.ModelID)
-	}
-
-	if c.Mapping.LeftRPMChannel < minChannelIndex || c.Mapping.LeftRPMChannel > maxChannelIndex {
-		return fmt.Errorf("mapping.left_rpm_channel must be in [%d..%d], got %d", minChannelIndex, maxChannelIndex, c.Mapping.LeftRPMChannel)
-	}
-	if c.Mapping.RightRPMChannel < minChannelIndex || c.Mapping.RightRPMChannel > maxChannelIndex {
-		return fmt.Errorf("mapping.right_rpm_channel must be in [%d..%d], got %d", minChannelIndex, maxChannelIndex, c.Mapping.RightRPMChannel)
-	}
-	if c.Mapping.LeftRPMChannel == c.Mapping.RightRPMChannel {
-		return fmt.Errorf("mapping.left_rpm_channel and mapping.right_rpm_channel must be different, both are %d", c.Mapping.LeftRPMChannel)
-	}
-	if c.Mapping.ScalingFactor <= 0 {
-		return fmt.Errorf("mapping.scaling_factor must be > 0, got %d", c.Mapping.ScalingFactor)
-	}
-
-	if c.Limits.CRSFMin < 0 || c.Limits.CRSFMin > absoluteCRSFMax {
-		return fmt.Errorf("limits.crsf_min must be in [0..%d], got %d", absoluteCRSFMax, c.Limits.CRSFMin)
-	}
-	if c.Limits.CRSFMax < 0 || c.Limits.CRSFMax > absoluteCRSFMax {
-		return fmt.Errorf("limits.crsf_max must be in [0..%d], got %d", absoluteCRSFMax, c.Limits.CRSFMax)
-	}
-	if c.Limits.CRSFMin > c.Limits.CRSFMax {
-		return fmt.Errorf("limits.crsf_min (%d) cannot be greater than limits.crsf_max (%d)", c.Limits.CRSFMin, c.Limits.CRSFMax)
-	}
-
-	if c.Mapping.OtherChannelsDefault < c.Limits.CRSFMin || c.Mapping.OtherChannelsDefault > c.Limits.CRSFMax {
-		return fmt.Errorf("mapping.other_channels_default must be in [%d..%d], got %d", c.Limits.CRSFMin, c.Limits.CRSFMax, c.Mapping.OtherChannelsDefault)
 	}
 
 	return nil
@@ -656,6 +639,14 @@ func controlSocketPath() string {
 	return path
 }
 
+func channelSocketPath() string {
+	path := strings.TrimSpace(os.Getenv("TOTA_ELRS_CHANNEL_SOCKET"))
+	if path == "" {
+		return defaultChannelSocketPath
+	}
+	return path
+}
+
 func writeSetModelIDIPCResponse(conn net.Conn, response setModelIDIPCResponse) {
 	if err := json.NewEncoder(conn).Encode(response); err != nil {
 		fmt.Printf("(model-id-ipc) failed to write response. %s\n", err.Error())
@@ -761,39 +752,142 @@ func startModelIDIPCServer(ctx context.Context, socketPath string, modelIDReques
 	return cleanup, nil
 }
 
+func newChannelFrameState(defaultValue util.CRSFValue) *channelFrameState {
+	state := &channelFrameState{}
+	state.setDisconnected(defaultValue)
+	return state
+}
+
+func (s *channelFrameState) setDisconnected(defaultValue util.CRSFValue) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for idx := range s.channels {
+		s.channels[idx] = defaultValue
+	}
+}
+
+func (s *channelFrameState) snapshot() [16]util.CRSFValue {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.channels
+}
+
+func (s *channelFrameState) setFromRequest(request setChannelsIPCRequest) error {
+	if len(request.Channels) != 16 {
+		return fmt.Errorf("channels payload must contain 16 values, got %d", len(request.Channels))
+	}
+
+	next := [16]util.CRSFValue{}
+	for idx, value := range request.Channels {
+		if value < 0 || value > absoluteCRSFMax {
+			return fmt.Errorf("channels[%d] must be in [0..%d], got %d", idx, absoluteCRSFMax, value)
+		}
+		next[idx] = util.CRSFValue(value)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.channels = next
+	return nil
+}
+
+func handleChannelFrameStreamConn(conn net.Conn, channelFrames *channelFrameState) error {
+	defer conn.Close()
+
+	decoder := json.NewDecoder(conn)
+	for {
+		var request setChannelsIPCRequest
+		if err := decoder.Decode(&request); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("decode failed: %w", err)
+		}
+
+		if err := channelFrames.setFromRequest(request); err != nil {
+			fmt.Printf("(channel-ipc) invalid frame ignored. %s\n", err.Error())
+		}
+	}
+}
+
+func startChannelFrameIPCServer(
+	ctx context.Context,
+	socketPath string,
+	defaultValue util.CRSFValue,
+	channelFrames *channelFrameState,
+) (func(), error) {
+	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("could not clear stale channel socket %s: %w", socketPath, err)
+	}
+
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("could not listen on channel socket %s: %w", socketPath, err)
+	}
+
+	cleanup := func() {
+		_ = listener.Close()
+		if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			fmt.Printf("(channel-ipc) could not remove socket %s. %s\n", socketPath, err.Error())
+		}
+	}
+
+	go func() {
+		<-ctx.Done()
+		cleanup()
+	}()
+
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				if ctx.Err() != nil || errors.Is(acceptErr, net.ErrClosed) {
+					return
+				}
+				fmt.Printf("(channel-ipc) accept failed on %s. %s\n", socketPath, acceptErr.Error())
+				continue
+			}
+
+			fmt.Printf("(channel-ipc) client connected socket=%s\n", socketPath)
+			if streamErr := handleChannelFrameStreamConn(conn, channelFrames); streamErr != nil {
+				fmt.Printf("(channel-ipc) stream ended with error. %s\n", streamErr.Error())
+			}
+			channelFrames.setDisconnected(defaultValue)
+			fmt.Printf("(channel-ipc) client disconnected, fallback to default channels\n")
+		}
+	}()
+
+	fmt.Printf("(channel-ipc) listening socket=%s\n", socketPath)
+	return cleanup, nil
+}
+
+func formatNonZeroChannels(channels [16]util.CRSFValue) string {
+	parts := make([]string, 0, len(channels))
+	for idx, value := range channels {
+		if value == 0 {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("ch%d=%d", idx, value))
+	}
+	if len(parts) == 0 {
+		return "all_zero"
+	}
+	return strings.Join(parts, " ")
+}
+
 func main() {
 	cfg, err := loadConfig(configFilePath)
 	if err != nil {
 		fmt.Printf("(app) failed to load config. %s\n", err.Error())
 		os.Exit(1)
 	}
-
-	if err = set_channel("left_rpm", cfg.Mapping.LeftRPMChannel); err != nil {
-		fmt.Printf("(app) invalid route for left_rpm. %s\n", err.Error())
-		os.Exit(1)
-	}
-	if err = set_channel("right_rpm", cfg.Mapping.RightRPMChannel); err != nil {
-		fmt.Printf("(app) invalid route for right_rpm. %s\n", err.Error())
-		os.Exit(1)
-	}
-	// Add more field routes here. Example: set_channel("led_cmd", 4)
-
-	minValue := util.CRSFValue(cfg.Limits.CRSFMin)
-	maxValue := util.CRSFValue(cfg.Limits.CRSFMax)
-	otherDefault := util.CRSFValue(cfg.Mapping.OtherChannelsDefault)
 	fmt.Printf("(app) loaded config=%s\n", configFilePath)
 	fmt.Printf(
-		"(app) starting ROS2->CRSF pipeline port=%s baud=%d model_id=%d topic=%s period_ms=%d routes=%s scaling_factor=%d other_default=%d limits=[%d..%d]\n",
+		"(app) starting ROS2->CRSF pipeline port=%s baud=%d model_id=%d period_ms=%d channel_input=ipc\n",
 		cfg.Serial.TXPortName,
 		cfg.Serial.TXBaudRate,
 		cfg.ModelMatch.ModelID,
-		cfg.ROS2.TopicName,
 		cfg.Link.ChannelSendPeriodMS,
-		formatRouteSummary(crsfChannelRoutes),
-		cfg.Mapping.ScalingFactor,
-		cfg.Mapping.OtherChannelsDefault,
-		cfg.Limits.CRSFMin,
-		cfg.Limits.CRSFMax,
 	)
 
 	serialPort, err := serial.Open(cfg.Serial.TXPortName, &serial.Mode{
@@ -824,25 +918,23 @@ func main() {
 	defer cancel()
 
 	modelIDRequests := make(chan modelIDChangeRequest)
-	socketPath := controlSocketPath()
-	cleanupIPC, err := startModelIDIPCServer(ctx, socketPath, modelIDRequests)
+	modelIDSocket := controlSocketPath()
+	cleanupModelIDIPC, err := startModelIDIPCServer(ctx, modelIDSocket, modelIDRequests)
 	if err != nil {
 		fmt.Printf("(model-id-ipc) startup failed. %s\n", err.Error())
 		os.Exit(1)
 	}
-	defer cleanupIPC()
+	defer cleanupModelIDIPC()
 
-	state := newWheelState()
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if subErr := runROS2Subscriber(ctx, cfg.ROS2.TopicName, state, cfg.Mapping.ScalingFactor, minValue, maxValue, crsfChannelRoutes, cfg.Logging); subErr != nil {
-			fmt.Printf("(ros2) subscriber fatal error. %s\n", subErr.Error())
-			cancel()
-		}
-	}()
+	defaultChannelValue := util.CRSFValue(0)
+	channelFrames := newChannelFrameState(defaultChannelValue)
+	channelSocket := channelSocketPath()
+	cleanupChannelIPC, err := startChannelFrameIPCServer(ctx, channelSocket, defaultChannelValue, channelFrames)
+	if err != nil {
+		fmt.Printf("(channel-ipc) startup failed. %s\n", err.Error())
+		os.Exit(1)
+	}
+	defer cleanupChannelIPC()
 
 	channelTicker := time.NewTicker(time.Duration(cfg.Link.ChannelSendPeriodMS) * time.Millisecond)
 	defer channelTicker.Stop()
@@ -851,7 +943,6 @@ func main() {
 		select {
 		case <-ctx.Done():
 			fmt.Printf("(app) shutdown requested\n")
-			wg.Wait()
 			fmt.Printf("(app) shutdown complete\n")
 			return
 		case request := <-modelIDRequests:
@@ -861,21 +952,7 @@ func main() {
 			}
 			request.Response <- writeErr
 		case <-channelTicker.C:
-			channels := [16]util.CRSFValue{}
-			for idx := range channels {
-				channels[idx] = otherDefault
-			}
-
-			routedFields := make([]string, 0, len(crsfChannelRoutes))
-			for field, channel := range crsfChannelRoutes {
-				value, ok := state.snapshotFieldValue(field)
-				if !ok {
-					continue
-				}
-				channels[channel] = value
-				routedFields = append(routedFields, fmt.Sprintf("%s=%d(ch=%d)", field, value, channel))
-			}
-			sort.Strings(routedFields)
+			channels := channelFrames.snapshot()
 
 			if _, err = serialPort.Write(crsf.PackChannels(&channels)); err != nil {
 				fmt.Printf("(send-loop) could not write channels on port %s. %s\n", cfg.Serial.TXPortName, err.Error())
@@ -884,8 +961,8 @@ func main() {
 			}
 			if cfg.Logging.TXWrites {
 				fmt.Printf(
-					"(send-loop) written routed=[%s] port=%s baud=%d\n",
-					strings.Join(routedFields, " "),
+					"(send-loop) written channels=[%s] port=%s baud=%d\n",
+					formatNonZeroChannels(channels),
 					cfg.Serial.TXPortName,
 					cfg.Serial.TXBaudRate,
 				)
