@@ -7,6 +7,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	crsf "github.com/kaack/elrs-joystick-control/pkg/crossfire"
@@ -14,9 +15,11 @@ import (
 	"go.bug.st/serial"
 	"gopkg.in/yaml.v3"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,13 +27,14 @@ import (
 )
 
 const (
-	configFilePath  = "config.yaml"
-	minChannelIndex = 0
-	maxChannelIndex = 15
-	absoluteCRSFMax = 2047
-	minModelID      = 0
-	maxModelID      = 63
-	modelIDRetries  = 5
+	configFilePath           = "config.yaml"
+	defaultControlSocketPath = "/tmp/tota_elrs_bridge_model_id.sock"
+	minChannelIndex          = 0
+	maxChannelIndex          = 15
+	absoluteCRSFMax          = 2047
+	minModelID               = 0
+	maxModelID               = 63
+	modelIDRetries           = 5
 )
 
 const modelIDRetryDelay = 250 * time.Millisecond
@@ -83,6 +87,21 @@ type Config struct {
 	Mapping    MappingConfig    `yaml:"mapping"`
 	Limits     LimitsConfig     `yaml:"limits"`
 	Logging    LoggingConfig    `yaml:"logging"`
+}
+
+type modelIDChangeRequest struct {
+	ModelID  int
+	Source   string
+	Response chan error
+}
+
+type setModelIDIPCRequest struct {
+	ModelID int `json:"model_id"`
+}
+
+type setModelIDIPCResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
 }
 
 func defaultConfig() Config {
@@ -192,27 +211,38 @@ type wheelState struct {
 
 	messageCount    uint64
 	parseErrorCount uint64
-	lastRawLeftRPM  int32
-	lastRawRightRPM int32
-	lastLeftCRSF    util.CRSFValue
-	lastRightCRSF   util.CRSFValue
+	lastRawValues   map[string]int32
+	lastCRSFValues  map[string]util.CRSFValue
 	lastRecvAt      time.Time
 	lastError       string
 }
 
-func (w *wheelState) update(rawLeft int32, rawRight int32, scalingFactor int, minValue util.CRSFValue, maxValue util.CRSFValue) (util.CRSFValue, util.CRSFValue) {
-	left := capToCRSFValue(rawLeft, scalingFactor, minValue, maxValue)
-	right := capToCRSFValue(rawRight, scalingFactor, minValue, maxValue)
+func newWheelState() *wheelState {
+	return &wheelState{
+		lastRawValues:  make(map[string]int32),
+		lastCRSFValues: make(map[string]util.CRSFValue),
+	}
+}
+
+func (w *wheelState) updateFields(rawValues map[string]int32, scalingFactor int, minValue util.CRSFValue, maxValue util.CRSFValue) map[string]util.CRSFValue {
+	capped := make(map[string]util.CRSFValue, len(rawValues))
+	for field, raw := range rawValues {
+		capped[field] = capToCRSFValue(raw, scalingFactor, minValue, maxValue)
+	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
 	w.messageCount += 1
-	w.lastRawLeftRPM = rawLeft
-	w.lastRawRightRPM = rawRight
-	w.lastLeftCRSF = left
-	w.lastRightCRSF = right
 	w.lastRecvAt = time.Now()
-	return left, right
+	for field, raw := range rawValues {
+		w.lastRawValues[field] = raw
+	}
+	for field, value := range capped {
+		w.lastCRSFValues[field] = value
+	}
+
+	return capped
 }
 
 func (w *wheelState) parseError(err error, line string) {
@@ -228,27 +258,64 @@ func (w *wheelState) setError(err string) {
 	w.lastError = err
 }
 
-func (w *wheelState) snapshot() (util.CRSFValue, util.CRSFValue) {
+func (w *wheelState) snapshotFieldValue(field string) (util.CRSFValue, bool) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	return w.lastLeftCRSF, w.lastRightCRSF
+	value, ok := w.lastCRSFValues[field]
+	return value, ok
 }
 
 func (w *wheelState) debugString(topic string) string {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
+	fields := make([]string, 0, len(w.lastCRSFValues))
+	for field, value := range w.lastCRSFValues {
+		fields = append(fields, fmt.Sprintf("%s=%d", field, value))
+	}
+	sort.Strings(fields)
 	return fmt.Sprintf(
-		"topic=%s msgs=%d parse_errors=%d last_raw_left=%d last_raw_right=%d last_left=%d last_right=%d last_recv=%s last_err=%s",
+		"topic=%s msgs=%d parse_errors=%d last_fields=[%s] last_recv=%s last_err=%s",
 		topic,
 		w.messageCount,
 		w.parseErrorCount,
-		w.lastRawLeftRPM,
-		w.lastRawRightRPM,
-		w.lastLeftCRSF,
-		w.lastRightCRSF,
+		strings.Join(fields, ","),
 		w.lastRecvAt.Format(time.RFC3339Nano),
 		w.lastError,
 	)
+}
+
+type channelRoutes map[string]int
+
+var crsfChannelRoutes = channelRoutes{}
+
+func set_channel(field string, channel int) error {
+	field = strings.TrimSpace(field)
+	if field == "" {
+		return errors.New("field name is required")
+	}
+	if channel < minChannelIndex || channel > maxChannelIndex {
+		return fmt.Errorf("channel must be in [%d..%d], got %d", minChannelIndex, maxChannelIndex, channel)
+	}
+
+	for existingField, existingChannel := range crsfChannelRoutes {
+		if existingField != field && existingChannel == channel {
+			return fmt.Errorf("channel %d is already assigned to field %q", channel, existingField)
+		}
+	}
+	crsfChannelRoutes[field] = channel
+	return nil
+}
+
+func formatRouteSummary(routes channelRoutes) string {
+	if len(routes) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(routes))
+	for field, channel := range routes {
+		parts = append(parts, fmt.Sprintf("%s->ch%d", field, channel))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ", ")
 }
 
 func capToCRSFValue(raw int32, scalingFactor int, minValue util.CRSFValue, maxValue util.CRSFValue) util.CRSFValue {
@@ -262,16 +329,39 @@ func capToCRSFValue(raw int32, scalingFactor int, minValue util.CRSFValue, maxVa
 	return util.CRSFValue(scaled)
 }
 
-func parseROS2FieldInt32(prefix string, line string) (int32, error) {
-	raw := strings.TrimSpace(strings.TrimPrefix(line, prefix))
-	if raw == "" {
-		return 0, errors.New("missing numeric value")
+func parseROS2FieldLine(line string) (string, string, bool) {
+	index := strings.Index(line, ":")
+	if index < 0 {
+		return "", "", false
 	}
-	value, err := strconv.ParseInt(raw, 10, 32)
-	if err != nil {
-		return 0, err
+	field := strings.TrimSpace(line[:index])
+	rawValue := strings.TrimSpace(line[index+1:])
+	if field == "" || rawValue == "" {
+		return "", "", false
 	}
-	return int32(value), nil
+	return field, rawValue, true
+}
+
+func clearRawFieldMap(values map[string]int32) {
+	for field := range values {
+		delete(values, field)
+	}
+}
+
+func formatRoutedUpdate(rawValues map[string]int32, cappedValues map[string]util.CRSFValue, routes channelRoutes) string {
+	if len(rawValues) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(rawValues))
+	for field, raw := range rawValues {
+		channel, ok := routes[field]
+		if !ok {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s(raw=%d,capped=%d,ch=%d)", field, raw, cappedValues[field], channel))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, " ")
 }
 
 func consumeROS2Stderr(ctx context.Context, reader io.Reader, state *wheelState, logErrors bool) {
@@ -300,38 +390,22 @@ func consumeROS2Stdout(
 	scalingFactor int,
 	minValue util.CRSFValue,
 	maxValue util.CRSFValue,
+	routes channelRoutes,
 	logRX bool,
 	logErrors bool,
 ) error {
 	scanner := bufio.NewScanner(reader)
-
-	var rawLeftRPM int32
-	var rawRightRPM int32
-	var haveLeft bool
-	var haveRight bool
+	rawFields := make(map[string]int32, len(routes))
 
 	flushMessage := func() {
-		if !haveLeft && !haveRight {
+		if len(rawFields) == 0 {
 			return
 		}
-		if !haveLeft || !haveRight {
-			err := errors.New("incomplete WheelRPM message")
-			line := fmt.Sprintf("left_present=%v right_present=%v", haveLeft, haveRight)
-			state.parseError(err, line)
-			if logErrors {
-				fmt.Printf("(ros2) incomplete WheelRPM message ignored (%s)\n", line)
-			}
-			haveLeft = false
-			haveRight = false
-			return
-		}
-
-		left, right := state.update(rawLeftRPM, rawRightRPM, scalingFactor, minValue, maxValue)
+		capped := state.updateFields(rawFields, scalingFactor, minValue, maxValue)
 		if logRX {
-			fmt.Printf("(ros2) WheelRPM raw left=%d right=%d capped left=%d right=%d\n", rawLeftRPM, rawRightRPM, left, right)
+			fmt.Printf("(ros2) routed update %s\n", formatRoutedUpdate(rawFields, capped, routes))
 		}
-		haveLeft = false
-		haveRight = false
+		clearRawFieldMap(rawFields)
 	}
 
 	for scanner.Scan() {
@@ -349,30 +423,25 @@ func consumeROS2Stdout(
 		switch {
 		case line == "---":
 			flushMessage()
-		case strings.HasPrefix(line, "left_rpm:"):
-			value, err := parseROS2FieldInt32("left_rpm:", line)
-			if err != nil {
-				state.parseError(err, line)
-				if logErrors {
-					fmt.Printf("(ros2) parse error on left_rpm line=%q err=%s\n", line, err.Error())
-				}
-				continue
-			}
-			rawLeftRPM = value
-			haveLeft = true
-		case strings.HasPrefix(line, "right_rpm:"):
-			value, err := parseROS2FieldInt32("right_rpm:", line)
-			if err != nil {
-				state.parseError(err, line)
-				if logErrors {
-					fmt.Printf("(ros2) parse error on right_rpm line=%q err=%s\n", line, err.Error())
-				}
-				continue
-			}
-			rawRightRPM = value
-			haveRight = true
 		default:
-			// ignore header and unknown fields
+			field, rawValue, ok := parseROS2FieldLine(line)
+			if !ok {
+				continue
+			}
+			if _, routed := routes[field]; !routed {
+				continue
+			}
+
+			value, err := strconv.ParseInt(rawValue, 10, 32)
+			if err != nil {
+				parseErr := fmt.Errorf("field %s expects int32 value: %w", field, err)
+				state.parseError(parseErr, line)
+				if logErrors {
+					fmt.Printf("(ros2) parse error on %s line=%q err=%s\n", field, line, parseErr.Error())
+				}
+				continue
+			}
+			rawFields[field] = int32(value)
 		}
 	}
 
@@ -387,6 +456,7 @@ func runROS2Subscriber(
 	scalingFactor int,
 	minValue util.CRSFValue,
 	maxValue util.CRSFValue,
+	routes channelRoutes,
 	logCfg LoggingConfig,
 ) error {
 	if logCfg.SubscriberErrors {
@@ -434,7 +504,7 @@ func runROS2Subscriber(
 					}
 
 					go consumeROS2Stderr(cmdCtx, stderr, state, logCfg.SubscriberErrors)
-					readErr := consumeROS2Stdout(cmdCtx, stdout, state, scalingFactor, minValue, maxValue, logCfg.ROS2RX, logCfg.SubscriberErrors)
+					readErr := consumeROS2Stdout(cmdCtx, stdout, state, scalingFactor, minValue, maxValue, routes, logCfg.ROS2RX, logCfg.SubscriberErrors)
 					waitErr := cmd.Wait()
 					cancel()
 
@@ -578,6 +648,119 @@ func sendModelIDFrameWithRetry(port serial.Port, modelID uint8, retries int, del
 	return nil
 }
 
+func controlSocketPath() string {
+	path := strings.TrimSpace(os.Getenv("TOTA_ELRS_MODEL_ID_SOCKET"))
+	if path == "" {
+		return defaultControlSocketPath
+	}
+	return path
+}
+
+func writeSetModelIDIPCResponse(conn net.Conn, response setModelIDIPCResponse) {
+	if err := json.NewEncoder(conn).Encode(response); err != nil {
+		fmt.Printf("(model-id-ipc) failed to write response. %s\n", err.Error())
+	}
+}
+
+func handleSetModelIDConn(ctx context.Context, conn net.Conn, modelIDRequests chan<- modelIDChangeRequest) {
+	defer conn.Close()
+
+	var request setModelIDIPCRequest
+	if err := json.NewDecoder(conn).Decode(&request); err != nil {
+		writeSetModelIDIPCResponse(conn, setModelIDIPCResponse{
+			Success: false,
+			Message: fmt.Sprintf("invalid request payload: %s", err.Error()),
+		})
+		return
+	}
+
+	if request.ModelID < minModelID || request.ModelID > maxModelID {
+		writeSetModelIDIPCResponse(conn, setModelIDIPCResponse{
+			Success: false,
+			Message: fmt.Sprintf("model_id must be in [%d..%d], got %d", minModelID, maxModelID, request.ModelID),
+		})
+		return
+	}
+
+	resultCh := make(chan error, 1)
+	changeRequest := modelIDChangeRequest{
+		ModelID:  request.ModelID,
+		Source:   "ros2 service",
+		Response: resultCh,
+	}
+
+	select {
+	case modelIDRequests <- changeRequest:
+	case <-ctx.Done():
+		writeSetModelIDIPCResponse(conn, setModelIDIPCResponse{
+			Success: false,
+			Message: "bridge is shutting down",
+		})
+		return
+	}
+
+	select {
+	case writeErr := <-resultCh:
+		if writeErr != nil {
+			writeSetModelIDIPCResponse(conn, setModelIDIPCResponse{
+				Success: false,
+				Message: writeErr.Error(),
+			})
+			return
+		}
+		writeSetModelIDIPCResponse(conn, setModelIDIPCResponse{
+			Success: true,
+			Message: fmt.Sprintf("model_id packet sent: %d", request.ModelID),
+		})
+	case <-ctx.Done():
+		writeSetModelIDIPCResponse(conn, setModelIDIPCResponse{
+			Success: false,
+			Message: "bridge is shutting down",
+		})
+	}
+}
+
+func startModelIDIPCServer(ctx context.Context, socketPath string, modelIDRequests chan<- modelIDChangeRequest) (func(), error) {
+	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("could not clear stale model-id socket %s: %w", socketPath, err)
+	}
+
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("could not listen on model-id socket %s: %w", socketPath, err)
+	}
+
+	cleanup := func() {
+		_ = listener.Close()
+		if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			fmt.Printf("(model-id-ipc) could not remove socket %s. %s\n", socketPath, err.Error())
+		}
+	}
+
+	go func() {
+		<-ctx.Done()
+		cleanup()
+	}()
+
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				if ctx.Err() != nil || errors.Is(acceptErr, net.ErrClosed) {
+					return
+				}
+				fmt.Printf("(model-id-ipc) accept failed on %s. %s\n", socketPath, acceptErr.Error())
+				continue
+			}
+
+			go handleSetModelIDConn(ctx, conn, modelIDRequests)
+		}
+	}()
+
+	fmt.Printf("(model-id-ipc) listening socket=%s\n", socketPath)
+	return cleanup, nil
+}
+
 func main() {
 	cfg, err := loadConfig(configFilePath)
 	if err != nil {
@@ -585,19 +768,28 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err = set_channel("left_rpm", cfg.Mapping.LeftRPMChannel); err != nil {
+		fmt.Printf("(app) invalid route for left_rpm. %s\n", err.Error())
+		os.Exit(1)
+	}
+	if err = set_channel("right_rpm", cfg.Mapping.RightRPMChannel); err != nil {
+		fmt.Printf("(app) invalid route for right_rpm. %s\n", err.Error())
+		os.Exit(1)
+	}
+	// Add more field routes here. Example: set_channel("led_cmd", 4)
+
 	minValue := util.CRSFValue(cfg.Limits.CRSFMin)
 	maxValue := util.CRSFValue(cfg.Limits.CRSFMax)
 	otherDefault := util.CRSFValue(cfg.Mapping.OtherChannelsDefault)
 	fmt.Printf("(app) loaded config=%s\n", configFilePath)
 	fmt.Printf(
-		"(app) starting ROS2->CRSF pipeline port=%s baud=%d model_id=%d topic=%s period_ms=%d left_ch=%d right_ch=%d scaling_factor=%d other_default=%d limits=[%d..%d]\n",
+		"(app) starting ROS2->CRSF pipeline port=%s baud=%d model_id=%d topic=%s period_ms=%d routes=%s scaling_factor=%d other_default=%d limits=[%d..%d]\n",
 		cfg.Serial.TXPortName,
 		cfg.Serial.TXBaudRate,
 		cfg.ModelMatch.ModelID,
 		cfg.ROS2.TopicName,
 		cfg.Link.ChannelSendPeriodMS,
-		cfg.Mapping.LeftRPMChannel,
-		cfg.Mapping.RightRPMChannel,
+		formatRouteSummary(crsfChannelRoutes),
 		cfg.Mapping.ScalingFactor,
 		cfg.Mapping.OtherChannelsDefault,
 		cfg.Limits.CRSFMin,
@@ -628,17 +820,25 @@ func main() {
 		fmt.Printf("%s\n", err.Error())
 	}
 
-
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	state := &wheelState{}
+	modelIDRequests := make(chan modelIDChangeRequest)
+	socketPath := controlSocketPath()
+	cleanupIPC, err := startModelIDIPCServer(ctx, socketPath, modelIDRequests)
+	if err != nil {
+		fmt.Printf("(model-id-ipc) startup failed. %s\n", err.Error())
+		os.Exit(1)
+	}
+	defer cleanupIPC()
+
+	state := newWheelState()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if subErr := runROS2Subscriber(ctx, cfg.ROS2.TopicName, state, cfg.Mapping.ScalingFactor, minValue, maxValue, cfg.Logging); subErr != nil {
+		if subErr := runROS2Subscriber(ctx, cfg.ROS2.TopicName, state, cfg.Mapping.ScalingFactor, minValue, maxValue, crsfChannelRoutes, cfg.Logging); subErr != nil {
 			fmt.Printf("(ros2) subscriber fatal error. %s\n", subErr.Error())
 			cancel()
 		}
@@ -654,15 +854,28 @@ func main() {
 			wg.Wait()
 			fmt.Printf("(app) shutdown complete\n")
 			return
+		case request := <-modelIDRequests:
+			writeErr := sendModelIDFrame(serialPort, uint8(request.ModelID), request.Source, cfg.Logging.TXWrites)
+			if writeErr != nil {
+				fmt.Printf("%s\n", writeErr.Error())
+			}
+			request.Response <- writeErr
 		case <-channelTicker.C:
-			left, right := state.snapshot()
-
 			channels := [16]util.CRSFValue{}
 			for idx := range channels {
 				channels[idx] = otherDefault
 			}
-			channels[cfg.Mapping.LeftRPMChannel] = left
-			channels[cfg.Mapping.RightRPMChannel] = right
+
+			routedFields := make([]string, 0, len(crsfChannelRoutes))
+			for field, channel := range crsfChannelRoutes {
+				value, ok := state.snapshotFieldValue(field)
+				if !ok {
+					continue
+				}
+				channels[channel] = value
+				routedFields = append(routedFields, fmt.Sprintf("%s=%d(ch=%d)", field, value, channel))
+			}
+			sort.Strings(routedFields)
 
 			if _, err = serialPort.Write(crsf.PackChannels(&channels)); err != nil {
 				fmt.Printf("(send-loop) could not write channels on port %s. %s\n", cfg.Serial.TXPortName, err.Error())
@@ -671,11 +884,8 @@ func main() {
 			}
 			if cfg.Logging.TXWrites {
 				fmt.Printf(
-					"(send-loop) written left=%d(ch=%d) right=%d(ch=%d) port=%s baud=%d\n",
-					left,
-					cfg.Mapping.LeftRPMChannel,
-					right,
-					cfg.Mapping.RightRPMChannel,
+					"(send-loop) written routed=[%s] port=%s baud=%d\n",
+					strings.Join(routedFields, " "),
 					cfg.Serial.TXPortName,
 					cfg.Serial.TXBaudRate,
 				)
