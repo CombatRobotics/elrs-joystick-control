@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	crsf "github.com/kaack/elrs-joystick-control/pkg/crossfire"
+	telem "github.com/kaack/elrs-joystick-control/pkg/crossfire/telemetry"
 	"github.com/kaack/elrs-joystick-control/pkg/util"
 	"go.bug.st/serial"
 	"gopkg.in/yaml.v3"
@@ -43,6 +44,34 @@ const modelIDRetryDelay = 250 * time.Millisecond
 const (
 	initConfigRetries   = 3
 	initConfigSendDelay = 50 * time.Millisecond
+)
+
+const (
+	// adminQuietWindow is how long to suppress channel-pack writes after an
+	// admin frame (model-id change, status request) so the firmware's
+	// half-duplex reply lands on a quiet line. The firmware's largest typical
+	// reply at 400k baud is ~2ms; 4ms gives a safe margin at any baud.
+	adminQuietWindow = 4 * time.Millisecond
+
+	// recvReadTimeout is the per-Read timeout on the serial port, used by
+	// the recv goroutine. Read returns periodically with no data so the
+	// goroutine can notice ctx cancel.
+	recvReadTimeout = 20 * time.Millisecond
+
+	// txAliveTimeout is how long we wait without any inbound TX-originated
+	// frame (sync, status, forwarded linkstats) before declaring the TX dead.
+	txAliveTimeout = 2 * time.Second
+
+	// txAliveCheckInterval is how often we poll for the tx-alive timeout above.
+	txAliveCheckInterval = 500 * time.Millisecond
+
+	// statusPollInterval is how often we send a PARAMETER_WRITE(0xEE, 0, 0)
+	// to ask the firmware for an ELRS status reply (which carries the model-
+	// match flag). 1s is plenty fresh and only one admin frame per second.
+	statusPollInterval = 1 * time.Second
+
+	// recvHeartbeatInterval throttles the (recv-loop) heartbeat log line.
+	recvHeartbeatInterval = 1 * time.Second
 )
 
 type SerialConfig struct {
@@ -875,6 +904,90 @@ func formatNonZeroChannels(channels [16]util.CRSFValue) string {
 	return strings.Join(parts, " ")
 }
 
+// runRecvLoop continuously decodes frames from the serial port and pushes
+// link-relevant events to the main loop via three buffered channels:
+//
+//   - syncEvents: every OPENTX_SYNC frame (used to phase-correct the channel
+//     ticker)
+//   - linkStatsEvents: every LinkStatistics arrival (used as another sign that
+//     the TX is actively forwarding telemetry)
+//   - statusEvents: every ELRS Status reply (used for the model-mismatch flag)
+//
+// Each channel is buffered=1 with non-blocking sends — if the main loop is
+// momentarily slow, we drop the older event rather than block the recv
+// goroutine. Sync arrives at 5/sec, LinkStats at ~4/sec, Status at 1/sec —
+// dropping a single one is harmless.
+//
+// Sync and LinkStats frames are logged directly here. Status frames are passed
+// to the main loop so the authoritative state print can include tx_alive and
+// is_model_mismatch.
+func runRecvLoop(
+	ctx context.Context,
+	port serial.Port,
+	syncEvents chan<- *telem.SyncExtFrame,
+	linkStatsEvents chan<- struct{},
+	statusEvents chan<- *telem.StatusExtFrame,
+) {
+	reader := telem.NewReader(port)
+	lastHeartbeat := time.Now()
+	fmt.Printf("(recv-loop) starting read_timeout=%s\n", recvReadTimeout)
+
+	for {
+		if ctx.Err() != nil {
+			fmt.Printf("(recv-loop) exiting (ctx cancelled)\n")
+			return
+		}
+
+		frame, err := reader.Next(ctx)
+		if err != nil {
+			if _, ok := err.(*telem.InterruptedError); ok {
+				fmt.Printf("(recv-loop) exiting (interrupted)\n")
+				return
+			}
+			// Most errors here are "frame crc mismatch" — already logged by
+			// the reader. Just keep going.
+			continue
+		}
+
+		switch f := frame.(type) {
+		case *telem.SyncExtFrame:
+			fmt.Printf("(recv-loop) [SYNC] %s\n", f)
+			select {
+			case syncEvents <- f:
+			default:
+			}
+		case *telem.LinkStatsFrame:
+			fmt.Printf("(recv-loop) [RX-LINK] %s\n", f)
+			select {
+			case linkStatsEvents <- struct{}{}:
+			default:
+			}
+		case *telem.StatusExtFrame:
+			select {
+			case statusEvents <- f:
+			default:
+			}
+		}
+
+		if time.Since(lastHeartbeat) >= recvHeartbeatInterval {
+			fmt.Printf("(recv-loop) heartbeat bytesRead=%d readCalls=%d zeroReads=%d framesGood=%d framesEcho=%d framesUnknown=%d framesCrcBad=%d\n",
+				reader.BytesRead, reader.ReadCalls, reader.ZeroReads,
+				reader.FramesGood, reader.FramesEcho, reader.FramesUnknown, reader.FramesCrcBad)
+			lastHeartbeat = time.Now()
+		}
+	}
+}
+
+// sendStatusRequest writes a CRSF_FRAMETYPE_PARAMETER_WRITE with
+// parameterIndex=0, value=0 to the TX module. The firmware treats this as
+// the "ELRS status request" (lua.cpp:363-370) and replies with a Status
+// frame carrying the LUA_FLAG_CONNECTED / LUA_FLAG_MODEL_MATCH flags.
+func sendStatusRequest(port serial.Port) error {
+	frame := crsf.CreateParameterSettingWriteFrameUint8(uint8(crsf.ModuleEndpoint), 0, 0)
+	_, err := port.Write(frame)
+	return err
+}
+
 func main() {
 	cfg, err := loadConfig(configFilePath)
 	if err != nil {
@@ -889,6 +1002,15 @@ func main() {
 		cfg.ModelMatch.ModelID,
 		cfg.Link.ChannelSendPeriodMS,
 	)
+
+	// For visibility only — show the firmware-recommended cadence next to the
+	// YAML-configured one. They should be the same (5ms at any baud >= 400k).
+	suggested := crsf.GetRefreshRate(int32(cfg.Serial.TXBaudRate))
+	configured := time.Duration(cfg.Link.ChannelSendPeriodMS) * time.Millisecond
+	fmt.Printf("(app) channel cadence: configured=%s suggested=%s (firmware default 5ms/200Hz)\n", configured, suggested)
+	if configured < suggested {
+		fmt.Printf("(app) WARNING: configured cadence %s is faster than firmware default %s — host bursts may collide with firmware replies\n", configured, suggested)
+	}
 
 	serialPort, err := serial.Open(cfg.Serial.TXPortName, &serial.Mode{
 		BaudRate: cfg.Serial.TXBaudRate,
@@ -905,6 +1027,13 @@ func main() {
 			fmt.Printf("(app) serial close error on %s. %s\n", cfg.Serial.TXPortName, closeErr.Error())
 		}
 	}()
+	// Required for the recv goroutine: bounded blocking on Read so it can
+	// notice ctx cancellation and exit cleanly. The send path is unaffected
+	// (Write doesn't honour this timeout).
+	if err = serialPort.SetReadTimeout(recvReadTimeout); err != nil {
+		fmt.Printf("(app) failed to set serial read timeout. %s\n", err.Error())
+		os.Exit(1)
+	}
 	fmt.Printf("(app) serial port opened %s @ %d baud\n", cfg.Serial.TXPortName, cfg.Serial.TXBaudRate)
 
 	if err = sendModelIDFrameWithRetry(serialPort, uint8(cfg.ModelMatch.ModelID), modelIDRetries, modelIDRetryDelay, cfg.Logging.TXWrites); err != nil {
@@ -936,8 +1065,88 @@ func main() {
 	}
 	defer cleanupChannelIPC()
 
-	channelTicker := time.NewTicker(time.Duration(cfg.Link.ChannelSendPeriodMS) * time.Millisecond)
+	// Recv side: spawn a goroutine that decodes frames continuously and
+	// pushes events back through three buffered channels.
+	syncEvents := make(chan *telem.SyncExtFrame, 1)
+	linkStatsEvents := make(chan struct{}, 1)
+	statusEvents := make(chan *telem.StatusExtFrame, 1)
+	go runRecvLoop(ctx, serialPort, syncEvents, linkStatsEvents, statusEvents)
+
+	// Channel-pack ticker. YAML configures the initial period (config.yaml
+	// channel_send_period_ms — set this to 5 for ELRS at any baud >= 400k).
+	// SyncPeriods adjusts steadyPeriod on every OPENTX_SYNC arrival.
+	steadyPeriod := time.Duration(cfg.Link.ChannelSendPeriodMS) * time.Millisecond
+	channelTicker := time.NewTicker(steadyPeriod)
 	defer channelTicker.Stop()
+	phaseShiftPending := false
+
+	// quietUntil suppresses channel-pack writes for adminQuietWindow after
+	// any admin frame (model-id change, status request) so the firmware's
+	// reply lands on a quiet line.
+	var quietUntil time.Time
+
+	var lastTxActivityAt time.Time
+	txAlive := false
+	modelMismatch := false
+
+	// Periodic status request to surface model-match state.
+	statusPollTicker := time.NewTicker(statusPollInterval)
+	defer statusPollTicker.Stop()
+	txAliveCheckTicker := time.NewTicker(txAliveCheckInterval)
+	defer txAliveCheckTicker.Stop()
+
+	// Last observed effective link state, for state-change-only logging.
+	lastStatusValid := false
+	lastStatusArmed := false
+	lastStatusPktsGood := uint16(0)
+	lastStatusPktsBad := uint8(0)
+	lastStatusMessage := ""
+	lastTxAlive := false
+	lastModelMismatch := false
+	lastFlagsText := "stale"
+
+	logStatus := func(flagsText string, source string, armed bool, pktsGood uint16, pktsBad uint8, msg string) {
+		fmt.Printf("(recv-loop) [STATUS] tx_alive=%v is_model_mismatch=%v armed=%v pktsGood=%d pktsBad=%d flags=%s msg=%q",
+			txAlive,
+			modelMismatch,
+			armed,
+			pktsGood,
+			pktsBad,
+			flagsText,
+			msg,
+		)
+		if source != "" {
+			fmt.Printf(" source=%s", source)
+		}
+		fmt.Printf("\n")
+
+		if !lastStatusValid ||
+			txAlive != lastTxAlive ||
+			modelMismatch != lastModelMismatch ||
+			armed != lastStatusArmed ||
+			pktsGood != lastStatusPktsGood ||
+			pktsBad != lastStatusPktsBad ||
+			msg != lastStatusMessage ||
+			flagsText != lastFlagsText {
+			fmt.Printf("(link) state changed: tx_alive=%v is_model_mismatch=%v armed=%v pktsGood=%d pktsBad=%d flags=%s msg=%q\n",
+				txAlive,
+				modelMismatch,
+				armed,
+				pktsGood,
+				pktsBad,
+				flagsText,
+				msg,
+			)
+			lastTxAlive = txAlive
+			lastModelMismatch = modelMismatch
+			lastStatusArmed = armed
+			lastStatusPktsGood = pktsGood
+			lastStatusPktsBad = pktsBad
+			lastStatusMessage = msg
+			lastFlagsText = flagsText
+			lastStatusValid = true
+		}
+	}
 
 	for {
 		select {
@@ -950,8 +1159,69 @@ func main() {
 			if writeErr != nil {
 				fmt.Printf("%s\n", writeErr.Error())
 			}
+			// Even on write error, set the quiet window — if the write
+			// partially succeeded the firmware may still reply.
+			quietUntil = time.Now().Add(adminQuietWindow)
 			request.Response <- writeErr
+
+		case sync := <-syncEvents:
+			lastTxActivityAt = time.Now()
+			txAlive = true
+
+			// One-shot phase shift: schedule the next channel tick so it
+			// lands in the firmware's expected RX window. Subsequent ticks
+			// revert to the steady period.
+			newSteady, nextTick := crsf.SyncPeriods(sync.Rate(), sync.Offset())
+			steadyPeriod = newSteady
+			channelTicker.Reset(nextTick)
+			phaseShiftPending = true
+
+		case <-linkStatsEvents:
+			now := time.Now()
+			lastTxActivityAt = now
+			txAlive = true
+
+		case <-txAliveCheckTicker.C:
+			now := time.Now()
+			if txAlive && !lastTxActivityAt.IsZero() && now.Sub(lastTxActivityAt) > txAliveTimeout {
+				txAlive = false
+				modelMismatch = false
+				if lastStatusValid {
+					logStatus("stale", "tx-timeout", lastStatusArmed, lastStatusPktsGood, lastStatusPktsBad, lastStatusMessage)
+				}
+			}
+
+		case <-statusPollTicker.C:
+			if writeErr := sendStatusRequest(serialPort); writeErr != nil {
+				fmt.Printf("(status-poll) write error: %s\n", writeErr.Error())
+				continue
+			}
+			quietUntil = time.Now().Add(adminQuietWindow)
+
+		case s := <-statusEvents:
+			lastTxActivityAt = time.Now()
+			txAlive = true
+			modelMismatch = s.ModelMismatched()
+			logStatus(
+				fmt.Sprintf("0x%02x", s.Flags()),
+				"",
+				s.Armed(),
+				s.PktsGood(),
+				s.PktsBad(),
+				s.Message(),
+			)
+
 		case <-channelTicker.C:
+			// Suppress channel-pack writes during the post-admin quiet window
+			// so the firmware's reply has a clean line.
+			if !quietUntil.IsZero() && time.Now().Before(quietUntil) {
+				if phaseShiftPending {
+					channelTicker.Reset(steadyPeriod)
+					phaseShiftPending = false
+				}
+				continue
+			}
+
 			channels := channelFrames.snapshot()
 
 			if _, err = serialPort.Write(crsf.PackChannels(&channels)); err != nil {
@@ -966,6 +1236,13 @@ func main() {
 					cfg.Serial.TXPortName,
 					cfg.Serial.TXBaudRate,
 				)
+			}
+
+			// If a one-shot phase-correction tick just fired, restore the
+			// steady period for subsequent ticks.
+			if phaseShiftPending {
+				channelTicker.Reset(steadyPeriod)
+				phaseShiftPending = false
 			}
 		}
 	}

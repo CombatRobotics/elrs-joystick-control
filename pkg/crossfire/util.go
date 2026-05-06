@@ -128,17 +128,26 @@ func CreateParameterSettingWriteFrameUint16(deviceId uint8, fieldId uint8, field
 	return frame
 }
 
+// GetRefreshRate returns a sensible initial channel-pack cadence for a given
+// UART baud rate.
+//
+// The host send cadence is set by the firmware's RequestedRCpacketInterval
+// (default 5000us = 200Hz), NOT by the UART baud. Higher baud only makes each
+// burst shorter on the wire; it does not change how often the firmware
+// expects a packet. Sending faster than firmware expects causes host bursts
+// to collide with the firmware's half-duplex reply window, which prevents
+// OPENTX_SYNC packets from ever arriving and the link never bootstraps.
+//
+// The previous logic returned MinRefreshRate (500us) for any baud >= 921600,
+// ~10x faster than the firmware ever wants. That broke bootstrap.
 func GetRefreshRate(baudRate int32) time.Duration {
 	if baudRate <= 115200 {
+		// Slow handsets (legacy / non-ELRS) — 16ms is conventional.
 		return 16 * 1000 * time.Microsecond
 	}
-
-	if baudRate <= 420000 {
-		return 4 * 1000 * time.Microsecond
-	}
-
-	//921600, 1870000, 3750000, 5250000
-	return MinRefreshRate
+	// 400k and up: match firmware default 200Hz. The firmware will refine
+	// this via OPENTX_SYNC packets once a clean RX is established.
+	return 5 * 1000 * time.Microsecond
 }
 
 func PackChannels(channels *[16]util.CRSFValue) (result []byte) {
@@ -176,15 +185,36 @@ func PackChannels(channels *[16]util.CRSFValue) (result []byte) {
 	return buf[:]
 }
 
-func AdjustSendRate(rate int32, offset int32) time.Duration {
-	duration := time.Duration((rate+offset)/10) * time.Microsecond
-	if duration <= 0 {
-		return MinRefreshRate
+// SyncPeriods converts a CRSF OPENTX_SYNC payload into a (steadyPeriod, nextPeriod)
+// pair. Both `rate` and `offset` are in 0.1 us units (firmware convention).
+//
+//   - steadyPeriod: the period the host should run at long-term (== rate).
+//   - nextPeriod:   the period to use for the very next tick only, so that
+//     subsequent ticks land in the firmware's expected RX window. Computed as
+//     `rate - offset` (a positive offset means the host arrived AFTER the
+//     firmware's expected slot, so the next tick must come SOONER).
+//
+// Both values are clamped to [MinRefreshRate, MaxRefreshRate] for sanity.
+//
+// Replaces the old AdjustSendRate which incorrectly returned (rate+offset)/10
+// as a permanent new period — that conflated rate and offset and applied a
+// one-shot phase correction as a permanent rate change, causing the period
+// to drift and never converge.
+func SyncPeriods(rate int32, offset int32) (steadyPeriod time.Duration, nextPeriod time.Duration) {
+	steadyPeriod = time.Duration(rate/10) * time.Microsecond
+	nextPeriod = time.Duration((rate-offset)/10) * time.Microsecond
+
+	if steadyPeriod < MinRefreshRate {
+		steadyPeriod = MinRefreshRate
+	} else if steadyPeriod > MaxRefreshRate {
+		steadyPeriod = MaxRefreshRate
 	}
 
-	if duration > MaxRefreshRate {
-		return MaxRefreshRate
+	if nextPeriod < MinRefreshRate {
+		nextPeriod = MinRefreshRate
+	} else if nextPeriod > MaxRefreshRate {
+		nextPeriod = MaxRefreshRate
 	}
 
-	return duration
+	return steadyPeriod, nextPeriod
 }
