@@ -1036,10 +1036,10 @@ func main() {
 	}
 	fmt.Printf("(app) serial port opened %s @ %d baud\n", cfg.Serial.TXPortName, cfg.Serial.TXBaudRate)
 
-	if err = sendModelIDFrameWithRetry(serialPort, uint8(cfg.ModelMatch.ModelID), modelIDRetries, modelIDRetryDelay, cfg.Logging.TXWrites); err != nil {
+	if err = sendELRSInitConfigSequence(serialPort, cfg.Logging.TXWrites); err != nil {
 		fmt.Printf("%s\n", err.Error())
 	}
-	if err = sendELRSInitConfigSequence(serialPort, cfg.Logging.TXWrites); err != nil {
+	if err = sendModelIDFrameWithRetry(serialPort, uint8(cfg.ModelMatch.ModelID), modelIDRetries, modelIDRetryDelay, cfg.Logging.TXWrites); err != nil {
 		fmt.Printf("%s\n", err.Error())
 	}
 
