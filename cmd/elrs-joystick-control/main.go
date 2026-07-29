@@ -36,10 +36,16 @@ const (
 	absoluteCRSFMax          = 2047
 	minModelID               = 0
 	maxModelID               = 63
-	modelIDRetries           = 5
 )
 
-const modelIDRetryDelay = 250 * time.Millisecond
+// modelIDResendInterval is how often the desired model id is re-sent while
+// the TX has not yet confirmed it (see the convergence state in the run loop).
+const modelIDResendInterval = 1 * time.Second
+
+// txSilentRestartAfter: if the TX module stays completely silent this long
+// despite an open serial port, exit so the supervisor respawns us with a
+// fresh serial session — the only remaining recovery lever for a wedged module.
+const txSilentRestartAfter = 30 * time.Second
 
 const (
 	initConfigRetries   = 3
@@ -629,37 +635,6 @@ func sendModelIDFrame(port serial.Port, modelID uint8, source string, logWrites 
 	return nil
 }
 
-func sendModelIDFrameWithRetry(port serial.Port, modelID uint8, retries int, delay time.Duration, logWrites bool) error {
-	if retries < 1 {
-		retries = 1
-	}
-
-	successCount := 0
-	var lastErr error
-
-	for attempt := 1; attempt <= retries; attempt++ {
-		source := fmt.Sprintf("startup burst=%d/%d", attempt, retries)
-		err := sendModelIDFrame(port, modelID, source, logWrites)
-		if err != nil {
-			lastErr = err
-			fmt.Printf("(model-id) burst attempt=%d/%d failed model_id=%d err=%s\n", attempt, retries, modelID, err.Error())
-		} else {
-			successCount++
-		}
-
-		if attempt < retries {
-			time.Sleep(delay)
-		}
-	}
-
-	if successCount == 0 {
-		return fmt.Errorf("(model-id) all burst attempts failed model_id=%d attempts=%d last_error=%w", modelID, retries, lastErr)
-	}
-
-	fmt.Printf("(model-id) startup burst complete model_id=%d success=%d/%d\n", modelID, successCount, retries)
-	return nil
-}
-
 func controlSocketPath() string {
 	path := strings.TrimSpace(os.Getenv("TOTA_ELRS_MODEL_ID_SOCKET"))
 	if path == "" {
@@ -1039,9 +1014,6 @@ func main() {
 	if err = sendELRSInitConfigSequence(serialPort, cfg.Logging.TXWrites); err != nil {
 		fmt.Printf("%s\n", err.Error())
 	}
-	if err = sendModelIDFrameWithRetry(serialPort, uint8(cfg.ModelMatch.ModelID), modelIDRetries, modelIDRetryDelay, cfg.Logging.TXWrites); err != nil {
-		fmt.Printf("%s\n", err.Error())
-	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
@@ -1088,6 +1060,28 @@ func main() {
 	var lastTxActivityAt time.Time
 	txAlive := false
 	modelMismatch := false
+
+	// Model-id convergence: re-send the desired id until a status reply that
+	// arrives after a send reports no mismatch — proof the admin path is live
+	// and the write took. Re-arms whenever the TX reappears after silence or
+	// a mismatch shows up later, so the id is re-asserted without any caller
+	// having to retry.
+	desiredModelID := uint8(cfg.ModelMatch.ModelID)
+	modelIDPending := true
+	modelIDSentSincePending := false
+	modelIDResendTicker := time.NewTicker(modelIDResendInterval)
+	defer modelIDResendTicker.Stop()
+	loopStartedAt := time.Now()
+
+	sendDesiredModelID := func(source string) {
+		if writeErr := sendModelIDFrame(serialPort, desiredModelID, source, cfg.Logging.TXWrites); writeErr != nil {
+			fmt.Printf("%s\n", writeErr.Error())
+		} else {
+			modelIDSentSincePending = true
+		}
+		quietUntil = time.Now().Add(adminQuietWindow)
+	}
+	sendDesiredModelID("startup")
 
 	// Periodic status request to surface model-match state.
 	statusPollTicker := time.NewTicker(statusPollInterval)
@@ -1155,17 +1149,31 @@ func main() {
 			fmt.Printf("(app) shutdown complete\n")
 			return
 		case request := <-modelIDRequests:
-			writeErr := sendModelIDFrame(serialPort, uint8(request.ModelID), request.Source, cfg.Logging.TXWrites)
+			desiredModelID = uint8(request.ModelID)
+			modelIDPending = true
+			modelIDSentSincePending = false
+			writeErr := sendModelIDFrame(serialPort, desiredModelID, request.Source, cfg.Logging.TXWrites)
 			if writeErr != nil {
 				fmt.Printf("%s\n", writeErr.Error())
+			} else {
+				modelIDSentSincePending = true
 			}
 			// Even on write error, set the quiet window — if the write
 			// partially succeeded the firmware may still reply.
 			quietUntil = time.Now().Add(adminQuietWindow)
 			request.Response <- writeErr
 
+		case <-modelIDResendTicker.C:
+			if modelIDPending {
+				sendDesiredModelID("converge")
+			}
+
 		case sync := <-syncEvents:
 			lastTxActivityAt = time.Now()
+			if !txAlive {
+				modelIDPending = true
+				modelIDSentSincePending = false
+			}
 			txAlive = true
 
 			// One-shot phase shift: schedule the next channel tick so it
@@ -1179,6 +1187,10 @@ func main() {
 		case <-linkStatsEvents:
 			now := time.Now()
 			lastTxActivityAt = now
+			if !txAlive {
+				modelIDPending = true
+				modelIDSentSincePending = false
+			}
 			txAlive = true
 
 		case <-txAliveCheckTicker.C:
@@ -1188,6 +1200,16 @@ func main() {
 				modelMismatch = false
 				if lastStatusValid {
 					logStatus("stale", "tx-timeout", lastStatusArmed, lastStatusPktsGood, lastStatusPktsBad, lastStatusMessage)
+				}
+			}
+			if !txAlive {
+				silentSince := lastTxActivityAt
+				if silentSince.IsZero() {
+					silentSince = loopStartedAt
+				}
+				if now.Sub(silentSince) > txSilentRestartAfter {
+					fmt.Printf("(app) TX module silent for %s despite open serial port — exiting for a fresh serial session\n", txSilentRestartAfter)
+					cancel()
 				}
 			}
 
@@ -1200,8 +1222,18 @@ func main() {
 
 		case s := <-statusEvents:
 			lastTxActivityAt = time.Now()
+			if !txAlive {
+				modelIDPending = true
+				modelIDSentSincePending = false
+			}
 			txAlive = true
 			modelMismatch = s.ModelMismatched()
+			if modelMismatch {
+				modelIDPending = true
+			} else if modelIDPending && modelIDSentSincePending {
+				modelIDPending = false
+				fmt.Printf("(model-id) confirmed by TX status: model_id=%d\n", desiredModelID)
+			}
 			logStatus(
 				fmt.Sprintf("0x%02x", s.Flags()),
 				"",
