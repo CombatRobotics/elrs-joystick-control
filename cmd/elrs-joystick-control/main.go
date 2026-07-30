@@ -1230,9 +1230,11 @@ func main() {
 			modelMismatch = s.ModelMismatched()
 			if modelMismatch {
 				modelIDPending = true
-			} else if modelIDPending && modelIDSentSincePending {
+			} else if modelIDPending && modelIDSentSincePending && s.Connected() {
+				// Only a live RX link with no mismatch proves the id took;
+				// an unlinked TX never clears the mismatch flag.
 				modelIDPending = false
-				fmt.Printf("(model-id) confirmed by TX status: model_id=%d\n", desiredModelID)
+				fmt.Printf("(model-id) confirmed: rx connected, model match, model_id=%d\n", desiredModelID)
 			}
 			logStatus(
 				fmt.Sprintf("0x%02x", s.Flags()),
