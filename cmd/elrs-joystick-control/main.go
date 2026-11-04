@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -987,7 +988,17 @@ func main() {
 		fmt.Printf("(app) WARNING: configured cadence %s is faster than firmware default %s — host bursts may collide with firmware replies\n", configured, suggested)
 	}
 
-	serialPort, err := serial.Open(cfg.Serial.TXPortName, &serial.Mode{
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	guard := &vtxGuard{}
+	go monitorVTX(ctx, wfbStatsAddress, guard)
+	fmt.Println("(vtx-interlock) waiting for fresh authenticated video reception; ELRS silent")
+	if !waitForVTX(ctx, guard) {
+		return
+	}
+	fmt.Println("(vtx-interlock) video link available; enabling ELRS serial writes")
+
+	rawSerialPort, err := serial.Open(cfg.Serial.TXPortName, &serial.Mode{
 		BaudRate: cfg.Serial.TXBaudRate,
 		Parity:   serial.NoParity,
 		DataBits: 8,
@@ -997,6 +1008,7 @@ func main() {
 		fmt.Printf("(app) failed to open serial port %s. %s\n", cfg.Serial.TXPortName, err.Error())
 		os.Exit(1)
 	}
+	serialPort := &vtxGuardedPort{Port: rawSerialPort, guard: guard, now: time.Now}
 	defer func() {
 		if closeErr := serialPort.Close(); closeErr != nil {
 			fmt.Printf("(app) serial close error on %s. %s\n", cfg.Serial.TXPortName, closeErr.Error())
@@ -1013,10 +1025,8 @@ func main() {
 
 	if err = sendELRSInitConfigSequence(serialPort, cfg.Logging.TXWrites); err != nil {
 		fmt.Printf("%s\n", err.Error())
+		return
 	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
 
 	modelIDRequests := make(chan modelIDChangeRequest)
 	modelIDSocket := controlSocketPath()

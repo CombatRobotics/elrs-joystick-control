@@ -471,3 +471,18 @@ steps to build the application:
   ./build-raspbian32-linux-armhf.sh
   ```
   The executable binary will be at the root of the repo
+
+## TOTA VTX interlock
+
+TOTA waits for fresh authenticated `video rx` reports from WFB-ng on
+`127.0.0.1:8103` before opening the ELRS serial port. All serial frame types are
+inhibited three seconds after the last accepted video report. A loss makes the
+bridge exit; the ROS supervisor restarts it silently and fresh video permits a
+new initialization. Old channel state is not carried across that restart.
+
+Run `go test -race ./...` and `go vet ./...`. The full-process pseudo-terminal
+regression in `tests/test_vtx_cutoff.py` must run in an isolated network namespace
+(see `.github/workflows/vtx-interlock.yaml`), never alongside a live controller.
+Physical RF-loss timing is limited by the WFB statistics reporting interval.
+Serial silence does not certify RF-module silence or receiver actuator failsafe
+behavior; those remain hardware acceptance checks.
