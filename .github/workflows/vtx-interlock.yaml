@@ -1,0 +1,25 @@
+name: VTX interlock checks
+on:
+  pull_request:
+  push:
+    branches: [dev, main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: CGO_ENABLED=0 go build -o /tmp/tota-elrs-test ./cmd/elrs-joystick-control
+      - name: Test all serial output in an isolated network namespace
+        run: >-
+          docker run --rm --network=none
+          -e TOTA_ISOLATED_TEST=1 -e TOTA_TEST_BRIDGE=/bridge
+          -v /tmp/tota-elrs-test:/bridge:ro
+          -v "$PWD/tests:/tests:ro"
+          python:3.12-slim python /tests/test_vtx_cutoff.py
